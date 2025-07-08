@@ -11,8 +11,10 @@ import {
 import { spawn, exec } from 'child_process';
 import { promisify } from 'util';
 import { readFile, access } from 'fs/promises';
+import { readdir } from 'fs/promises';
 import { homedir } from 'os';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { glob } from 'glob';
 
 const execAsync = promisify(exec);
 
@@ -76,7 +78,7 @@ class SSHMCPServer {
       // Skip empty lines and comments
       if (!line || line.startsWith('#')) continue;
 
-      // Handle Include directive
+      // Handle Include directive (case insensitive)
       if (line.toLowerCase().startsWith('include ')) {
         const includePath = line.substring(8).trim();
         await this.handleInclude(includePath, basePath);
@@ -136,8 +138,25 @@ class SSHMCPServer {
       // Replace ~ with home directory
       fullPath = fullPath.replace('~', homedir());
 
-      // For now, handle simple includes (no wildcards)
-      if (!fullPath.includes('*')) {
+      // Handle wildcards using glob pattern matching
+      if (fullPath.includes('*')) {
+        try {
+          const files = await glob(fullPath);
+          console.error(`Found ${files.length} files matching pattern: ${fullPath}`);
+          for (const file of files) {
+            try {
+              console.error(`Loading SSH config from: ${file}`);
+              const includeContent = await readFile(file, 'utf-8');
+              await this.parseSSHConfig(includeContent, file);
+            } catch (error) {
+              console.warn(`Could not load include file: ${file}`, error);
+            }
+          }
+        } catch (error) {
+          console.warn(`Could not expand glob pattern: ${fullPath}`, error);
+        }
+      } else {
+        // Handle non-wildcard includes
         try {
           const includeContent = await readFile(fullPath, 'utf-8');
           await this.parseSSHConfig(includeContent, fullPath);
