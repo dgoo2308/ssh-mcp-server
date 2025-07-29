@@ -19,7 +19,11 @@ An MCP (Model Context Protocol) server that enables SSH remote command execution
 ### File Operations
 - **Upload Files**: Transfer files to remote hosts via SCP
 - **Download Files**: Retrieve files from remote hosts
+- **Edit Files**: Line-based editing with replace, insert, and delete operations
+- **Rewrite Files**: Complete file content replacement with backup support
+- **Append to Files**: Add content to the end of files
 - **Secure Transfer**: Uses your existing SSH keys and security settings
+- **Base64 Content Handling**: Safe handling of special characters and multi-line content
 
 ## 🛠 Installation
 
@@ -173,6 +177,82 @@ Download files from remote hosts:
 }
 ```
 
+### 7. ssh_edit_file
+Edit specific lines in files using sed commands:
+
+**Replace line by number:**
+```json
+{
+  "host": "odoo-prod",
+  "filePath": "/opt/odoo/config/odoo.conf",
+  "operation": "replace",
+  "lineNumber": 15,
+  "content": "workers = 8",
+  "backup": true
+}
+```
+
+**Replace by pattern:**
+```json
+{
+  "host": "rpi-sensor-1",
+  "filePath": "/etc/systemd/system/sensor.service",
+  "operation": "replace",
+  "pattern": "ExecStart=.*",
+  "content": "ExecStart=/usr/bin/python3 /opt/sensor/main.py --config=/etc/sensor.conf",
+  "backup": true
+}
+```
+
+**Insert new line:**
+```json
+{
+  "host": "odoo-dev",
+  "filePath": "/opt/odoo/addons/my_module/__manifest__.py",
+  "operation": "insert",
+  "lineNumber": 10,
+  "content": "    'version': '1.0.1',",
+  "backup": true
+}
+```
+
+**Delete line:**
+```json
+{
+  "host": "rpi-sensor-2",
+  "filePath": "/etc/crontab",
+  "operation": "delete",
+  "pattern": ".*old-sensor-job.*",
+  "backup": true
+}
+```
+
+### 8. ssh_rewrite_file
+Completely replace file contents:
+
+```json
+{
+  "host": "odoo-prod",
+  "filePath": "/opt/odoo/scripts/backup.sh",
+  "content": "#!/bin/bash\n\n# Enhanced backup script\nDATE=$(date +%Y%m%d_%H%M%S)\nBACKUP_DIR=\"/opt/backups/odoo\"\n\n# Create backup directory\nmkdir -p \"$BACKUP_DIR\"\n\n# Dump database\nsudo -u postgres pg_dump odoo_production > \"$BACKUP_DIR/odoo_db_$DATE.sql\"\n\n# Backup filestore\ntar -czf \"$BACKUP_DIR/filestore_$DATE.tar.gz\" /opt/odoo/data/filestore\n\necho \"Backup completed: $DATE\"",
+  "backup": true,
+  "createDirectories": true
+}
+```
+
+### 9. ssh_append_to_file
+Append content to files:
+
+```json
+{
+  "host": "rpi-sensor-1",
+  "filePath": "/var/log/sensor.log",
+  "content": "2024-01-15 10:30:00 - Manual log entry: Sensor calibration completed",
+  "newline": true,
+  "createFile": true
+}
+```
+
 ## 🎯 Use Cases
 
 ### Odoo Development & Operations
@@ -191,6 +271,15 @@ Download files from remote hosts:
 
 # Performance monitoring
 "Show CPU and memory usage on odoo-prod"
+
+# Configuration management
+"Update worker count in Odoo config file"
+
+# Code deployment
+"Replace old function with new implementation in Python module"
+
+# Log management
+"Append deployment log entry with timestamp"
 ```
 
 ### IoT Device Management
@@ -209,6 +298,15 @@ Download files from remote hosts:
 
 # Network diagnostics
 "Check network connectivity from all IoT devices"
+
+# Configuration updates
+"Edit sensor thresholds in config files across all devices"
+
+# Script deployment
+"Deploy new monitoring script to all IoT devices"
+
+# Log maintenance
+"Append maintenance log entries after system updates"
 ```
 
 ## 🔐 Security Features
@@ -219,27 +317,70 @@ Download files from remote hosts:
 - **Timeout Protection**: Prevents runaway processes with configurable timeouts
 - **Base64 Safety**: Eliminates injection risks through command escaping
 
-## 🧠 Why Base64 Encoding?
+## 🧠 Base64 Encoding Strategy
 
-Base64 encoding solves common SSH command execution problems:
+This MCP server uses a smart base64 encoding strategy to handle complex content safely while maintaining readability for simple operations.
 
-### Before (Escaping Hell):
+### When Base64 is Used:
+
+1. **Always for Scripts**: Multi-line scripts (`ssh_execute_script`) always use base64
+2. **Always for File Content**: File rewrite and append operations use base64 for content
+3. **Optional for Commands**: Single commands can optionally use base64 (`useBase64: true`)
+4. **Smart for File Editing**: Line editing uses base64 internally within commands
+
+### Encoding Strategies by Operation:
+
+**Command Execution:**
 ```bash
-ssh server 'ps aux | grep "my app" | awk '"'"'{print $2}'"'"' | xargs kill'
-```
+# Simple command (no base64):
+ssh server "systemctl status nginx"
 
-### After (Base64 Magic):
-```bash
+# Complex command (with base64):
 # Your command: ps aux | grep "my app" | awk '{print $2}' | xargs kill
 # Becomes: echo 'cHMgYXV4IHwgZ3JlcCAibXkgYXBwIiB8IGF3ayAne3ByaW50ICQyfScgfCB4YXJncyBraWxs' | base64 -d | bash
 ```
 
-**Benefits:**
-- No more quote escaping nightmares
-- Handles special characters perfectly
-- Works with complex pipes and redirections
-- Supports multi-line scripts seamlessly
-- Eliminates shell interpretation issues
+**File Operations:**
+```bash
+# File content (always base64):
+echo 'SGVsbG8gV29ybGQhCkZyb20gbXkgZmlsZSE=' | base64 -d > /path/to/file
+
+# Line editing (base64 within sed commands):
+echo 'SGVsbG8gV29ybGQh' | base64 -d | sed -i '5s/.*/'"$(echo 'TmV3IGxpbmUgY29udGVudA==' | base64 -d)"'/' /path/to/file
+```
+
+### Why This Approach?
+
+**For Simple Commands:**
+- Direct execution is faster and more readable
+- No encoding overhead for basic operations
+- Easier debugging and logging
+
+**For Complex Content:**
+- **No Escaping Hell**: Eliminates quote and special character issues
+- **Multi-line Safety**: Handles scripts and file content perfectly
+- **Special Characters**: Unicode, symbols, and control characters work seamlessly
+- **Injection Prevention**: Base64 prevents command injection attacks
+- **Consistency**: Same encoding method across different shells and systems
+
+### Before vs After Examples:
+
+**Complex Command - Before (Escaping Hell):**
+```bash
+ssh server 'ps aux | grep "my app" | awk '"'"'{print $2}'"'"' | xargs kill'
+```
+
+**Complex Command - After (Base64):**
+```bash
+ssh server "echo 'cHMgYXV4IHwgZ3JlcCAibXkgYXBwIiB8IGF3ayAne3ByaW50ICQyfScgfCB4YXJncyBraWxs' | base64 -d | bash"
+```
+
+**File Content with Special Characters:**
+```bash
+# Content: #!/bin/bash\necho "Hello $USER"\ndate '+%Y-%m-%d %H:%M:%S'
+# Base64: IyEvYmluL2Jhc2gKZWNobyAiSGVsbG8gJFVTRVIiCmRhdGUgJysrWS0lbS0lZCAlSDolTTolUyc=
+ssh server "echo 'IyEvYmluL2Jhc2gKZWNobyAiSGVsbG8gJFVTRVIiCmRhdGUgJysrWS0lbS0lZCAlSDolTTolUyc=' | base64 -d > /opt/script.sh"
+```
 
 ## 📁 Project Structure
 
