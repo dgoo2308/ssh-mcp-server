@@ -294,6 +294,110 @@ class SSHMCPServer {
             required: ['host', 'remotePath', 'localPath'],
           },
         },
+        {
+          name: 'ssh_edit_file',
+          description: 'Edit specific lines in a file on a remote host using sed commands',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Path to the file on the remote host',
+              },
+              operation: {
+                type: 'string',
+                enum: ['replace', 'insert', 'delete'],
+                description: 'Type of edit operation to perform',
+              },
+              lineNumber: {
+                type: 'number',
+                description: 'Line number to edit (1-based). For insert, new content will be inserted after this line',
+              },
+              content: {
+                type: 'string',
+                description: 'Content to insert or replace with (not used for delete operation)',
+              },
+              pattern: {
+                type: 'string',
+                description: 'Pattern to match for replace operation (alternative to lineNumber)',
+              },
+              backup: {
+                type: 'boolean',
+                description: 'Create backup file before editing (default: true)',
+                default: true,
+              },
+            },
+            required: ['host', 'filePath', 'operation'],
+          },
+        },
+        {
+          name: 'ssh_rewrite_file',
+          description: 'Completely rewrite/replace the contents of a file on a remote host',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Path to the file on the remote host',
+              },
+              content: {
+                type: 'string',
+                description: 'New content for the file',
+              },
+              backup: {
+                type: 'boolean',
+                description: 'Create backup file before rewriting (default: true)',
+                default: true,
+              },
+              createDirectories: {
+                type: 'boolean',
+                description: 'Create parent directories if they do not exist (default: false)',
+                default: false,
+              },
+            },
+            required: ['host', 'filePath', 'content'],
+          },
+        },
+        {
+          name: 'ssh_append_to_file',
+          description: 'Append content to the end of a file on a remote host',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Path to the file on the remote host',
+              },
+              content: {
+                type: 'string',
+                description: 'Content to append to the file',
+              },
+              newline: {
+                type: 'boolean',
+                description: 'Add a newline before appended content (default: true)',
+                default: true,
+              },
+              createFile: {
+                type: 'boolean',
+                description: 'Create file if it does not exist (default: true)',
+                default: true,
+              },
+            },
+            required: ['host', 'filePath', 'content'],
+          },
+        },
       ],
     }));
 
@@ -340,6 +444,35 @@ class SSHMCPServer {
               args.host as string, 
               args.remotePath as string, 
               args.localPath as string
+            );
+          
+          case 'ssh_edit_file':
+            return await this.editFile(
+              args.host as string,
+              args.filePath as string,
+              args.operation as string,
+              args.lineNumber as number,
+              args.content as string,
+              args.pattern as string,
+              (args.backup as boolean) ?? true
+            );
+          
+          case 'ssh_rewrite_file':
+            return await this.rewriteFile(
+              args.host as string,
+              args.filePath as string,
+              args.content as string,
+              (args.backup as boolean) ?? true,
+              (args.createDirectories as boolean) ?? false
+            );
+          
+          case 'ssh_append_to_file':
+            return await this.appendToFile(
+              args.host as string,
+              args.filePath as string,
+              args.content as string,
+              (args.newline as boolean) ?? true,
+              (args.createFile as boolean) ?? true
             );
           
           default:
@@ -581,6 +714,251 @@ class SSHMCPServer {
             },
           ],
         });
+      });
+    });
+  }
+
+  private async editFile(
+    host: string, 
+    filePath: string, 
+    operation: string, 
+    lineNumber?: number, 
+    content?: string, 
+    pattern?: string, 
+    backup: boolean = true
+  ): Promise<any> {
+    const hostConfig = this.sshHosts.get(host);
+    if (!hostConfig) {
+      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
+    }
+
+    let sedCommand = '';
+    const backupSuffix = backup ? '.bak' : '';
+    const backupFlag = backup ? `-i${backupSuffix}` : '-i';
+
+    switch (operation) {
+      case 'replace':
+        if (lineNumber && content !== undefined) {
+          // Replace specific line number
+          const escapedContent = content.replace(/'/g, "'\"'\"'");
+          sedCommand = `sed ${backupFlag} '${lineNumber}s/.*/'"'"'${escapedContent}'"'"'/' "${filePath}"`;
+        } else if (pattern && content !== undefined) {
+          // Replace by pattern
+          const escapedPattern = pattern.replace(/'/g, "'\"'\"'");
+          const escapedContent = content.replace(/'/g, "'\"'\"'");
+          sedCommand = `sed ${backupFlag} 's/'"'"'${escapedPattern}'"'"'/'"'"'${escapedContent}'"'"'/g' "${filePath}"`;
+        } else {
+          throw new McpError(ErrorCode.InvalidRequest, 'Replace operation requires either lineNumber or pattern, and content');
+        }
+        break;
+      
+      case 'insert':
+        if (lineNumber && content !== undefined) {
+          const escapedContent = content.replace(/'/g, "'\"'\"'");
+          sedCommand = `sed ${backupFlag} '${lineNumber}a\\'"'"'${escapedContent}'"'"'' "${filePath}"`;
+        } else {
+          throw new McpError(ErrorCode.InvalidRequest, 'Insert operation requires lineNumber and content');
+        }
+        break;
+      
+      case 'delete':
+        if (lineNumber) {
+          sedCommand = `sed ${backupFlag} '${lineNumber}d' "${filePath}"`;
+        } else if (pattern) {
+          const escapedPattern = pattern.replace(/'/g, "'\"'\"'");
+          sedCommand = `sed ${backupFlag} '/'"'"'${escapedPattern}'"'"'/d' "${filePath}"`;
+        } else {
+          throw new McpError(ErrorCode.InvalidRequest, 'Delete operation requires either lineNumber or pattern');
+        }
+        break;
+      
+      default:
+        throw new McpError(ErrorCode.InvalidRequest, `Unknown operation: ${operation}`);
+    }
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, sedCommand], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                filePath,
+                operation,
+                lineNumber,
+                pattern,
+                content: operation === 'delete' ? undefined : content,
+                backup,
+                exitCode: code,
+                success: code === 0,
+                stdout: stdout.trim(),
+                stderr: stderr.trim(),
+                message: code === 0 ? 'File edited successfully' : 'Edit operation failed',
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH edit file failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async rewriteFile(
+    host: string, 
+    filePath: string, 
+    content: string, 
+    backup: boolean = true, 
+    createDirectories: boolean = false
+  ): Promise<any> {
+    const hostConfig = this.sshHosts.get(host);
+    if (!hostConfig) {
+      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
+    }
+
+    // Use base64 encoding to safely handle content with special characters
+    const encodedContent = Buffer.from(content).toString('base64');
+    
+    let command = '';
+    if (createDirectories) {
+      command += `mkdir -p "$(dirname "${filePath}")"; `;
+    }
+    
+    if (backup) {
+      command += `[ -f "${filePath}" ] && cp "${filePath}" "${filePath}.bak"; `;
+    }
+    
+    command += `echo '${encodedContent}' | base64 -d > "${filePath}"`;
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                filePath,
+                backup,
+                createDirectories,
+                contentLength: content.length,
+                contentLines: content.split('\n').length,
+                exitCode: code,
+                success: code === 0,
+                stdout: stdout.trim(),
+                stderr: stderr.trim(),
+                message: code === 0 ? 'File rewritten successfully' : 'Rewrite operation failed',
+                encoding: 'base64',
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH rewrite file failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async appendToFile(
+    host: string, 
+    filePath: string, 
+    content: string, 
+    newline: boolean = true, 
+    createFile: boolean = true
+  ): Promise<any> {
+    const hostConfig = this.sshHosts.get(host);
+    if (!hostConfig) {
+      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
+    }
+
+    // Use base64 encoding to safely handle content with special characters
+    const finalContent = newline && content.length > 0 && !content.startsWith('\n') ? '\n' + content : content;
+    const encodedContent = Buffer.from(finalContent).toString('base64');
+    
+    let command = '';
+    if (createFile) {
+      command += `touch "${filePath}"; `;
+    }
+    
+    command += `echo '${encodedContent}' | base64 -d >> "${filePath}"`;
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                filePath,
+                newline,
+                createFile,
+                contentLength: content.length,
+                contentLines: content.split('\n').length,
+                exitCode: code,
+                success: code === 0,
+                stdout: stdout.trim(),
+                stderr: stderr.trim(),
+                message: code === 0 ? 'Content appended successfully' : 'Append operation failed',
+                encoding: 'base64',
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH append to file failed: ${error.message}`));
       });
     });
   }
