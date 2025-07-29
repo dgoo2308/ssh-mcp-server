@@ -48,6 +48,8 @@ npm run build
 
 Add this to your Claude Desktop `claude_desktop_config.json`:
 
+**Basic Configuration:**
+
 ```json
 {
   "mcpServers": {
@@ -58,6 +60,42 @@ Add this to your Claude Desktop `claude_desktop_config.json`:
     }
   }
 }
+```
+
+## 🎯 Using with Claude Desktop
+
+Once configured, you can use natural language commands with Claude Desktop:
+
+### **Quick Commands**
+```
+"Check if the Odoo service is running on my production server"
+"Update the REMOTE variable in /etc/vct-iot/vct-iot.env to use IP 167.71.218.232"
+"Show me the last 20 lines of logs from my IoT sensor"
+"Deploy the new backup script to all my Odoo servers"
+```
+
+### **File Editing Examples**
+```
+"Replace all occurrences of 'old-server.com' with 'new-server.com' in my nginx config"
+"Change the worker count to 8 in the Odoo configuration file"
+"Add a new cron job to run sensor calibration daily at 2 AM"
+"Update the database connection string in my application config"
+```
+
+### **Environment Management**
+```
+"Set DEBUG=false in all environment files across my IoT devices"
+"Update the API endpoint in my sensor configuration files"
+"Change the log level to INFO in my production services"
+"Replace the old certificate path with the new one in all configs"
+```
+
+### **Bulk Operations**
+```
+"Check disk space on all my servers and show me which ones are running low"
+"Update the sensor threshold values across all my IoT devices"
+"Deploy the latest firmware to all Raspberry Pi sensors"
+"Backup all Odoo databases and compress the files"
 ```
 
 ### SSH Config Example
@@ -178,7 +216,16 @@ Download files from remote hosts:
 ```
 
 ### 7. ssh_edit_file
-Edit specific lines in files using sed commands:
+Edit specific lines in files using reliable sed commands with regex pattern support:
+
+> **✅ Fixed in v0.1.1**: Pattern replacements like `REMOTE=.*` now work correctly! The sed command generation has been completely rewritten for better reliability across different Linux distributions.
+
+**Pattern Replacement Features:**
+- **Regex Support**: Patterns like `KEY=.*`, `server.*\.com`, `^#.*` work as expected
+- **Smart Escaping**: Only escapes delimiters, preserves regex functionality  
+- **Base64 Safety**: Complex patterns automatically use base64 encoding
+- **Cross-Platform**: Works on OpenWrt, Ubuntu, CentOS, Alpine, etc.
+- **Automatic Backups**: Creates `.bak` files before editing
 
 **Replace line by number:**
 ```json
@@ -192,14 +239,38 @@ Edit specific lines in files using sed commands:
 }
 ```
 
-**Replace by pattern:**
+**Replace by pattern (Environment Variables):**
 ```json
 {
-  "host": "rpi-sensor-1",
-  "filePath": "/etc/systemd/system/sensor.service",
+  "host": "rpi-sensor-1", 
+  "filePath": "/etc/vct-iot/vct-iot.env",
+  "operation": "replace",
+  "pattern": "REMOTE=.*",
+  "content": "REMOTE=167.71.218.232",
+  "backup": true
+}
+```
+
+**Replace by pattern (Service Configuration):**
+```json
+{
+  "host": "odoo-prod",
+  "filePath": "/etc/systemd/system/odoo.service", 
   "operation": "replace",
   "pattern": "ExecStart=.*",
-  "content": "ExecStart=/usr/bin/python3 /opt/sensor/main.py --config=/etc/sensor.conf",
+  "content": "ExecStart=/usr/bin/python3 /opt/odoo/odoo-bin -c /etc/odoo/odoo.conf",
+  "backup": true
+}
+```
+
+**Replace by pattern (Configuration Values):**
+```json
+{
+  "host": "rpi-sensor-2",
+  "filePath": "/opt/config/sensor.conf",
+  "operation": "replace", 
+  "pattern": "threshold.*=.*",
+  "content": "threshold_temp = 25.5",
   "backup": true
 }
 ```
@@ -379,8 +450,58 @@ ssh server "echo 'cHMgYXV4IHwgZ3JlcCAibXkgYXBwIiB8IGF3ayAne3ByaW50ICQyfScgfCB4YX
 ```bash
 # Content: #!/bin/bash\necho "Hello $USER"\ndate '+%Y-%m-%d %H:%M:%S'
 # Base64: IyEvYmluL2Jhc2gKZWNobyAiSGVsbG8gJFVTRVIiCmRhdGUgJysrWS0lbS0lZCAlSDolTTolUyc=
-ssh server "echo 'IyEvYmluL2Jhc2gKZWNobyAiSGVsbG8gJFVTRVIiCmRhdGUgJysrWS0lbS0lZCAlSDolTTolUyc=' | base64 -d > /opt/script.sh"
+ssh server "echo 'IyEvYmluL2Jhc2gKZWNobyAiSGVsbG8gJFVTRVIiCmRhdGUgJysrWS0lbS0lZCElSDolTTolUyc=' | base64 -d > /opt/script.sh"
 ```
+
+## 🔧 Pattern Replacement Reliability (v0.1.1)
+
+### What Was Fixed
+
+The `ssh_edit_file` function has been completely rewritten to solve pattern replacement issues:
+
+**Before (v0.1.0 - Broken):**
+- Pattern `REMOTE=.*` would be over-escaped and fail to match
+- Complex nested quoting caused shell parsing errors  
+- Base64 command substitution inside sed commands was unreliable
+
+**After (v0.1.1 - Fixed):**
+- Regex patterns work correctly: `REMOTE=.*`, `KEY=.*`, `^#.*`, etc.
+- Smart escaping preserves regex functionality
+- Base64 encoding used only when needed for complex content
+- Temporary sed script files for maximum reliability
+
+### Pattern Examples That Now Work
+
+```bash
+# Environment variables
+REMOTE=.*  → REMOTE=167.71.218.232
+DEBUG=.*   → DEBUG=false
+API_KEY=.* → API_KEY=new-secret-key
+
+# Configuration patterns  
+workers.*=.*     → workers = 8
+threshold.*=.*   → threshold_temp = 25.5
+^#.*listen.*     → listen 80;
+
+# Service configurations
+ExecStart=.*     → ExecStart=/usr/bin/python3 /opt/app/main.py
+User=.*          → User=odoo
+Group=.*         → Group=odoo
+
+# Network configurations
+option ipaddr '.*'    → option ipaddr '192.168.1.100'
+server .*\.example\.com → server new.example.com
+```
+
+### Cross-Platform Compatibility
+
+The fix ensures reliability across different Linux distributions:
+
+- **OpenWrt**: Works with BusyBox sed implementation
+- **Ubuntu/Debian**: Compatible with GNU sed
+- **CentOS/RHEL**: Works with GNU sed variations  
+- **Alpine Linux**: Compatible with BusyBox sed
+- **Embedded systems**: Handles limited `/tmp` space scenarios
 
 ## 📁 Project Structure
 
@@ -457,6 +578,32 @@ Error: base64: command not found
 - Most modern systems have base64 installed
 - On older systems, try using `openssl base64 -d` instead
 
+**5. Pattern Replacement Not Working**
+```
+Error: File edited successfully but content unchanged
+```
+- **Check pattern syntax**: Use regex patterns like `KEY=.*` not literal strings
+- **Verify file permissions**: Ensure file is writable by SSH user
+- **Test pattern manually**: `ssh your-host "grep 'your-pattern' /path/to/file"`
+- **Check for special characters**: Patterns with quotes may need base64 encoding
+- **Line endings**: Windows line endings (`\r\n`) may cause issues
+
+**6. File Edit Operation Failed**
+```
+Error: sed: can't read /tmp/sed_script_12345: No such file or directory
+```
+- **Disk space**: Check if `/tmp` has available space on target host
+- **Permissions**: Ensure user can write to `/tmp` directory
+- **Filesystem**: Some embedded systems have read-only `/tmp` - use `/var/tmp` instead
+
+**7. Backup File Issues**
+```
+Error: cannot create backup file
+```
+- **Disk space**: Not enough space for backup file
+- **Permissions**: User cannot write to target directory
+- **Disable backup**: Set `"backup": false` if backups aren't needed
+
 ### Debug Steps
 
 1. **Test SSH connectivity:**
@@ -473,6 +620,28 @@ ssh your-host "echo 'ZGF0ZQo=' | base64 -d | bash"
 3. **Check SSH config parsing:**
 ```bash
 ssh -F ~/.ssh/config -T your-host
+```
+
+4. **Test pattern replacement manually:**
+```bash
+# Test if pattern matches
+ssh your-host "grep 'REMOTE=.*' /etc/vct-iot/vct-iot.env"
+
+# Test sed replacement
+ssh your-host "sed 's/REMOTE=.*/REMOTE=167.71.218.232/g' /etc/vct-iot/vct-iot.env"
+
+# Test with backup
+ssh your-host "cp /etc/vct-iot/vct-iot.env /etc/vct-iot/vct-iot.env.bak && sed -i 's/REMOTE=.*/REMOTE=167.71.218.232/g' /etc/vct-iot/vct-iot.env"
+```
+
+5. **Test complex patterns with base64:**
+```bash
+# Create sed script
+echo 's/pattern_with_special_chars/replacement/g' | base64
+# Output: cy9wYXR0ZXJuX3dpdGhfc3BlY2lhbF9jaGFycy9yZXBsYWNlbWVudC9n
+
+# Test the script
+ssh your-host "echo 'cy9wYXR0ZXJuX3dpdGhfc3BlY2lhbF9jaGFycy9yZXBsYWNlbWVudC9n' | base64 -d > /tmp/test_sed && sed -f /tmp/test_sed /path/to/file"
 ```
 
 ## 📝 Example SSH Config Structure
