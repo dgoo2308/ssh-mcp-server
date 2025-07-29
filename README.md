@@ -29,18 +29,20 @@ An MCP (Model Context Protocol) server that enables SSH remote command execution
 
 ## 🛠 Installation
 
-1. **Create and navigate to the project directory:**
+### Quick Install (Recommended)
+
+Run the install script to automatically clone, build, and configure:
+
 ```bash
-cd /Users/dgoo2308/git/ssh_mcp
+curl -sSL https://raw.githubusercontent.com/v-odoo-testing/ssh-mcp-server/main/install.sh | bash
 ```
 
-2. **Install dependencies:**
+Or clone manually:
+
 ```bash
+git clone git@github.com:v-odoo-testing/ssh-mcp-server.git ~/git/ssh_mcp
+cd ~/git/ssh_mcp
 npm install
-```
-
-3. **Build the project:**
-```bash
 npm run build
 ```
 
