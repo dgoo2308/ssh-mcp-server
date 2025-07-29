@@ -9,14 +9,12 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import { spawn, exec } from 'child_process';
-import { promisify } from 'util';
 import { readFile, access } from 'fs/promises';
-import { readdir } from 'fs/promises';
 import { homedir } from 'os';
-import { join, dirname } from 'path';
+import { join } from 'path';
 import { glob } from 'glob';
 
-const execAsync = promisify(exec);
+// const execAsync = promisify(exec); // Commented out - not currently used
 
 interface SSHHost {
   host: string;
@@ -745,12 +743,22 @@ class SSHMCPServer {
         if (lineNumber && content !== undefined) {
           // Replace specific line number using base64
           const encodedContent = Buffer.from(content).toString('base64');
-          command += `sed -i '${lineNumber}s/.*/'"'"'$(echo "${encodedContent}" | base64 -d)'"'"'/' "${filePath}"`;
+          command += `echo '${encodedContent}' | base64 -d | { read newline; sed -i '${lineNumber}s/.*/'"\$newline"'/' "${filePath}"; }`;
         } else if (pattern && content !== undefined) {
-          // Replace by pattern using base64
-          const encodedPattern = Buffer.from(pattern).toString('base64');
-          const encodedContent = Buffer.from(content).toString('base64');
-          command += `sed -i 's/'"'"'$(echo "${encodedPattern}" | base64 -d)'"'"'/'"'"'$(echo "${encodedContent}" | base64 -d)'"'"'/g' "${filePath}"`;
+          // Replace by pattern using proper escaping and base64 for complex content
+          // Escape special sed characters in pattern and replacement
+          const escapedPattern = this.escapeSedPattern(pattern);
+          const escapedContent = this.escapeSedReplacement(content);
+          
+          // For very complex patterns or content, use base64 with a temporary script
+          if (this.needsBase64Encoding(pattern, content)) {
+            const sedScript = `s/${escapedPattern}/${escapedContent}/g`;
+            const encodedScript = Buffer.from(sedScript).toString('base64');
+            command += `echo '${encodedScript}' | base64 -d > /tmp/sed_script_$$ && sed -i -f /tmp/sed_script_$$ "${filePath}"; rm -f /tmp/sed_script_$$`;
+          } else {
+            // Use direct sed command for simple cases
+            command += `sed -i 's/${escapedPattern}/${escapedContent}/g' "${filePath}"`;
+          }
         } else {
           throw new McpError(ErrorCode.InvalidRequest, 'Replace operation requires either lineNumber or pattern, and content');
         }
@@ -760,7 +768,7 @@ class SSHMCPServer {
         if (lineNumber && content !== undefined) {
           // Insert new line using base64
           const encodedContent = Buffer.from(content).toString('base64');
-          command += `sed -i '${lineNumber}a\\'"'"'$(echo "${encodedContent}" | base64 -d)'"'"'' "${filePath}"`;
+          command += `echo '${encodedContent}' | base64 -d | { read newline; sed -i '${lineNumber}a\\'"\$newline" "${filePath}"; }`;
         } else {
           throw new McpError(ErrorCode.InvalidRequest, 'Insert operation requires lineNumber and content');
         }
@@ -771,9 +779,15 @@ class SSHMCPServer {
           // Delete specific line number
           command += `sed -i '${lineNumber}d' "${filePath}"`;
         } else if (pattern) {
-          // Delete lines matching pattern using base64
-          const encodedPattern = Buffer.from(pattern).toString('base64');
-          command += `sed -i '/'"'"'$(echo "${encodedPattern}" | base64 -d)'"'"'/d' "${filePath}"`;
+          // Delete lines matching pattern
+          const escapedPattern = this.escapeSedPattern(pattern);
+          if (this.needsBase64Encoding(pattern, '')) {
+            const sedScript = `/${escapedPattern}/d`;
+            const encodedScript = Buffer.from(sedScript).toString('base64');
+            command += `echo '${encodedScript}' | base64 -d > /tmp/sed_script_$$ && sed -i -f /tmp/sed_script_$$ "${filePath}"; rm -f /tmp/sed_script_$$`;
+          } else {
+            command += `sed -i '/${escapedPattern}/d' "${filePath}"`;
+          }
         } else {
           throw new McpError(ErrorCode.InvalidRequest, 'Delete operation requires either lineNumber or pattern');
         }
@@ -969,6 +983,39 @@ class SSHMCPServer {
         reject(new McpError(ErrorCode.InternalError, `SSH append to file failed: ${error.message}`));
       });
     });
+  }
+
+  private escapeSedPattern(pattern: string): string {
+    // Escape only the delimiter and backslashes in patterns
+    // We want to preserve regex functionality (. * ^ $ [ ] should work as regex)
+    // Only escape what would break the sed command structure
+    return pattern
+      .replace(/\\/g, '\\\\')  // Backslash must be escaped first
+      .replace(/\//g, '\\/');  // Forward slash (delimiter)
+  }
+
+  private escapeSedReplacement(replacement: string): string {
+    // Escape special sed characters in replacement strings
+    // These characters have special meaning in sed replacements: & \ / and newlines
+    return replacement
+      .replace(/\\/g, '\\\\')  // Backslash must be escaped first
+      .replace(/\//g, '\\/')   // Forward slash (delimiter)
+      .replace(/&/g, '\\&')    // Ampersand (represents matched text)
+      .replace(/\n/g, '\\n');  // Newlines
+  }
+
+  private needsBase64Encoding(pattern: string, content: string): boolean {
+    // Determine if pattern or content needs base64 encoding due to complexity
+    const complexChars = /['"$`\\(){}|;<>*?[\]~]/;
+    const hasNewlines = /\n/;
+    const hasUnicode = /[^\x00-\x7F]/;
+    
+    return complexChars.test(pattern) || 
+           complexChars.test(content) || 
+           hasNewlines.test(pattern) || 
+           hasNewlines.test(content) ||
+           hasUnicode.test(pattern) || 
+           hasUnicode.test(content);
   }
 
   private setupErrorHandling(): void {
