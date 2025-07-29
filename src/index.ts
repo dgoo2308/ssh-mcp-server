@@ -26,15 +26,21 @@ interface SSHHost {
   [key: string]: any;
 }
 
+interface ServerFilter {
+  allow: string[];
+  disallow: string[];
+}
+
 class SSHMCPServer {
   private server: Server;
   private sshHosts: Map<string, SSHHost> = new Map();
+  private serverFilter: ServerFilter;
 
   constructor() {
     this.server = new Server(
       {
         name: 'ssh-remote-commands',
-        version: '0.1.0',
+        version: '0.2.0',
       },
       {
         capabilities: {
@@ -43,6 +49,7 @@ class SSHMCPServer {
       }
     );
 
+    this.serverFilter = this.loadServerFilter();
     this.setupToolHandlers();
     this.setupErrorHandling();
   }
@@ -88,7 +95,7 @@ class SSHMCPServer {
 
       if (key.toLowerCase() === 'host') {
         // Save previous host if exists
-        if (currentHost) {
+        if (currentHost && this.isHostAllowed(currentHost.host)) {
           this.sshHosts.set(currentHost.host, currentHost);
         }
         
@@ -120,7 +127,7 @@ class SSHMCPServer {
     }
 
     // Save last host
-    if (currentHost) {
+    if (currentHost && this.isHostAllowed(currentHost.host)) {
       this.sshHosts.set(currentHost.host, currentHost);
     }
   }
@@ -486,10 +493,7 @@ class SSHMCPServer {
   }
 
   private async executeCommand(host: string, command: string, timeout: number, useBase64: boolean = false): Promise<any> {
-    const hostConfig = this.sshHosts.get(host);
-    if (!hostConfig) {
-      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
-    }
+    const hostConfig = this.validateHostAccess(host);
 
     let finalCommand: string;
     
@@ -550,10 +554,7 @@ class SSHMCPServer {
   }
 
   private async executeScript(host: string, script: string, timeout: number, interpreter: string = 'bash'): Promise<any> {
-    const hostConfig = this.sshHosts.get(host);
-    if (!hostConfig) {
-      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
-    }
+    const hostConfig = this.validateHostAccess(host);
 
     // Always use base64 for scripts to handle multi-line content safely
     const encodedScript = Buffer.from(script).toString('base64');
@@ -631,10 +632,7 @@ class SSHMCPServer {
   }
 
   private async getHostInfo(host: string): Promise<any> {
-    const hostConfig = this.sshHosts.get(host);
-    if (!hostConfig) {
-      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
-    }
+    const hostConfig = this.validateHostAccess(host);
 
     return {
       content: [
@@ -647,10 +645,7 @@ class SSHMCPServer {
   }
 
   private async uploadFile(host: string, localPath: string, remotePath: string): Promise<any> {
-    const hostConfig = this.sshHosts.get(host);
-    if (!hostConfig) {
-      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
-    }
+    const hostConfig = this.validateHostAccess(host);
 
     return new Promise((resolve, reject) => {
       const scpCommand = `scp "${localPath}" "${host}:${remotePath}"`;
@@ -682,10 +677,7 @@ class SSHMCPServer {
   }
 
   private async downloadFile(host: string, remotePath: string, localPath: string): Promise<any> {
-    const hostConfig = this.sshHosts.get(host);
-    if (!hostConfig) {
-      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
-    }
+    const hostConfig = this.validateHostAccess(host);
 
     return new Promise((resolve, reject) => {
       const scpCommand = `scp "${host}:${remotePath}" "${localPath}"`;
@@ -725,10 +717,7 @@ class SSHMCPServer {
     pattern?: string, 
     backup: boolean = true
   ): Promise<any> {
-    const hostConfig = this.sshHosts.get(host);
-    if (!hostConfig) {
-      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
-    }
+    const hostConfig = this.validateHostAccess(host);
 
     // Use base64 encoding for all content to avoid escaping issues
     let command = '';
@@ -851,10 +840,7 @@ class SSHMCPServer {
     backup: boolean = true, 
     createDirectories: boolean = false
   ): Promise<any> {
-    const hostConfig = this.sshHosts.get(host);
-    if (!hostConfig) {
-      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
-    }
+    const hostConfig = this.validateHostAccess(host);
 
     // Use base64 encoding to safely handle content with special characters
     const encodedContent = Buffer.from(content).toString('base64');
@@ -923,10 +909,7 @@ class SSHMCPServer {
     newline: boolean = true, 
     createFile: boolean = true
   ): Promise<any> {
-    const hostConfig = this.sshHosts.get(host);
-    if (!hostConfig) {
-      throw new McpError(ErrorCode.InvalidRequest, `Host '${host}' not found in SSH config`);
-    }
+    const hostConfig = this.validateHostAccess(host);
 
     // Use base64 encoding to safely handle content with special characters
     const finalContent = newline && content.length > 0 && !content.startsWith('\n') ? '\n' + content : content;
@@ -1016,6 +999,101 @@ class SSHMCPServer {
            hasNewlines.test(content) ||
            hasUnicode.test(pattern) || 
            hasUnicode.test(content);
+  }
+
+  private loadServerFilter(): ServerFilter {
+    const defaultFilter: ServerFilter = { allow: [], disallow: [] };
+    
+    try {
+      const allowEnv = process.env.SSH_MCP_ALLOW;
+      const disallowEnv = process.env.SSH_MCP_DISALLOW;
+      
+      const allow = allowEnv ? JSON.parse(allowEnv) : [];
+      const disallow = disallowEnv ? JSON.parse(disallowEnv) : [];
+      
+      if (!Array.isArray(allow)) {
+        console.warn('SSH_MCP_ALLOW must be a JSON array, using empty array');
+        return { allow: [], disallow: Array.isArray(disallow) ? disallow : [] };
+      }
+      
+      if (!Array.isArray(disallow)) {
+        console.warn('SSH_MCP_DISALLOW must be a JSON array, using empty array');
+        return { allow, disallow: [] };
+      }
+      
+      console.error(`Server filter loaded - Allow: ${allow.length} patterns, Disallow: ${disallow.length} patterns`);
+      return { allow, disallow };
+    } catch (error) {
+      console.warn('Error parsing server filter environment variables:', error);
+      return defaultFilter;
+    }
+  }
+
+  private matchesPattern(hostname: string, pattern: string): boolean {
+    // Convert wildcard pattern to regex
+    // Escape regex special characters except *
+    const escapedPattern = pattern
+      .replace(/[.+?^${}()|[\]\\]/g, '\\$&')  // Escape regex special chars
+      .replace(/\*/g, '.*');  // Convert * to .*
+    
+    const regex = new RegExp(`^${escapedPattern}$`);
+    return regex.test(hostname);
+  }
+
+  private isHostAllowed(hostname: string): boolean {
+    const { allow, disallow } = this.serverFilter;
+    
+    // If no filters are configured, allow all hosts
+    if (allow.length === 0 && disallow.length === 0) {
+      return true;
+    }
+    
+    // Check disallow list first (takes precedence)
+    for (const pattern of disallow) {
+      if (this.matchesPattern(hostname, pattern)) {
+        console.error(`Host '${hostname}' blocked by disallow pattern: '${pattern}'`);
+        return false;
+      }
+    }
+    
+    // If allow list is empty, allow by default (only disallow list applies)
+    if (allow.length === 0) {
+      return true;
+    }
+    
+    // Check allow list
+    for (const pattern of allow) {
+      if (this.matchesPattern(hostname, pattern)) {
+        console.error(`Host '${hostname}' allowed by pattern: '${pattern}'`);
+        return true;
+      }
+    }
+    
+    // If allow list exists but no patterns match, deny
+    console.error(`Host '${hostname}' not allowed - no matching allow patterns`);
+    return false;
+  }
+
+  private validateHostAccess(host: string): SSHHost {
+    const hostConfig = this.sshHosts.get(host);
+    
+    if (hostConfig) {
+      return hostConfig;
+    }
+    
+    // Host not in map - check if it's filtered vs. not in config
+    if (!this.isHostAllowed(host)) {
+      throw new McpError(
+        ErrorCode.InvalidRequest, 
+        `Host '${host}' is not allowed by server access filters`
+      );
+    }
+    
+    // Host not found in SSH config
+    throw new McpError(
+      ErrorCode.InvalidRequest, 
+      `Host '${host}' not found in SSH config`
+    );
   }
 
   private setupErrorHandling(): void {
