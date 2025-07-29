@@ -257,7 +257,7 @@ class SSHMCPServer {
         },
         {
           name: 'ssh_upload_file',
-          description: 'Upload a file to a remote host via SCP',
+          description: 'Upload a file or directory to a remote host via SCP',
           inputSchema: {
             type: 'object',
             properties: {
@@ -267,11 +267,26 @@ class SSHMCPServer {
               },
               localPath: {
                 type: 'string',
-                description: 'Local file path',
+                description: 'Local file or directory path',
               },
               remotePath: {
                 type: 'string',
                 description: 'Remote destination path',
+              },
+              recursive: {
+                type: 'boolean',
+                description: 'Upload directory recursively (default: false)',
+                default: false,
+              },
+              preservePermissions: {
+                type: 'boolean',
+                description: 'Preserve file permissions (default: true)',
+                default: true,
+              },
+              createDirectories: {
+                type: 'boolean',
+                description: 'Create parent directories if they do not exist (default: true)',
+                default: true,
               },
             },
             required: ['host', 'localPath', 'remotePath'],
@@ -279,7 +294,7 @@ class SSHMCPServer {
         },
         {
           name: 'ssh_download_file',
-          description: 'Download a file from a remote host via SCP',
+          description: 'Download a file or directory from a remote host via SCP',
           inputSchema: {
             type: 'object',
             properties: {
@@ -289,11 +304,26 @@ class SSHMCPServer {
               },
               remotePath: {
                 type: 'string',
-                description: 'Remote file path',
+                description: 'Remote file or directory path',
               },
               localPath: {
                 type: 'string',
                 description: 'Local destination path',
+              },
+              recursive: {
+                type: 'boolean',
+                description: 'Download directory recursively (default: false)',
+                default: false,
+              },
+              preservePermissions: {
+                type: 'boolean',
+                description: 'Preserve file permissions (default: true)',
+                default: true,
+              },
+              createDirectories: {
+                type: 'boolean',
+                description: 'Create parent directories if they do not exist (default: true)',
+                default: true,
               },
             },
             required: ['host', 'remotePath', 'localPath'],
@@ -403,6 +433,56 @@ class SSHMCPServer {
             required: ['host', 'filePath', 'content'],
           },
         },
+        {
+          name: 'ssh_bulk_transfer',
+          description: 'Efficiently transfer entire directories using tar streaming over SSH',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              direction: {
+                type: 'string',
+                enum: ['download', 'upload'],
+                description: 'Transfer direction: download (remote to local) or upload (local to remote)',
+              },
+              remotePath: {
+                type: 'string',
+                description: 'Remote directory path',
+              },
+              localPath: {
+                type: 'string',
+                description: 'Local directory path',
+              },
+              compression: {
+                type: 'string',
+                enum: ['none', 'gzip', 'bzip2', 'xz'],
+                description: 'Compression method (default: gzip)',
+                default: 'gzip',
+              },
+              preservePermissions: {
+                type: 'boolean',
+                description: 'Preserve file permissions and timestamps (default: true)',
+                default: true,
+              },
+              excludePatterns: {
+                type: 'array',
+                items: {
+                  type: 'string'
+                },
+                description: 'Patterns to exclude from transfer (tar --exclude format)',
+              },
+              createDirectories: {
+                type: 'boolean',
+                description: 'Create parent directories if they do not exist (default: true)',
+                default: true,
+              },
+            },
+            required: ['host', 'direction', 'remotePath', 'localPath'],
+          },
+        },
       ],
     }));
 
@@ -441,14 +521,20 @@ class SSHMCPServer {
             return await this.uploadFile(
               args.host as string, 
               args.localPath as string, 
-              args.remotePath as string
+              args.remotePath as string,
+              (args.recursive as boolean) ?? false,
+              (args.preservePermissions as boolean) ?? true,
+              (args.createDirectories as boolean) ?? true
             );
           
           case 'ssh_download_file':
             return await this.downloadFile(
               args.host as string, 
               args.remotePath as string, 
-              args.localPath as string
+              args.localPath as string,
+              (args.recursive as boolean) ?? false,
+              (args.preservePermissions as boolean) ?? true,
+              (args.createDirectories as boolean) ?? true
             );
           
           case 'ssh_edit_file':
@@ -478,6 +564,18 @@ class SSHMCPServer {
               args.content as string,
               (args.newline as boolean) ?? true,
               (args.createFile as boolean) ?? true
+            );
+          
+          case 'ssh_bulk_transfer':
+            return await this.bulkTransfer(
+              args.host as string,
+              args.direction as string,
+              args.remotePath as string,
+              args.localPath as string,
+              (args.compression as string) ?? 'gzip',
+              (args.preservePermissions as boolean) ?? true,
+              (args.excludePatterns as string[]) ?? [],
+              (args.createDirectories as boolean) ?? true
             );
           
           default:
@@ -644,15 +742,50 @@ class SSHMCPServer {
     };
   }
 
-  private async uploadFile(host: string, localPath: string, remotePath: string): Promise<any> {
+  private async uploadFile(
+    host: string, 
+    localPath: string, 
+    remotePath: string, 
+    recursive: boolean = false, 
+    preservePermissions: boolean = true,
+    createDirectories: boolean = true
+  ): Promise<any> {
     const hostConfig = this.validateHostAccess(host);
 
     return new Promise((resolve, reject) => {
-      const scpCommand = `scp "${localPath}" "${host}:${remotePath}"`;
+      // Build SCP command with proper options and escaping
+      let scpOptions = [];
       
-      exec(scpCommand, (error, stdout, stderr) => {
+      if (recursive) {
+        scpOptions.push('-r');
+      }
+      
+      if (preservePermissions) {
+        scpOptions.push('-p');
+      }
+      
+      // Add compression for better performance over slower connections
+      scpOptions.push('-C');
+      
+      // Properly escape paths that might contain spaces or special characters
+      const escapedLocalPath = `"${localPath.replace(/"/g, '\\"')}"`;
+      const escapedRemotePath = `"${host}:${remotePath.replace(/"/g, '\\"')}"`;
+      
+      let finalCommand: string;
+      
+      if (createDirectories) {
+        // Create parent directory on remote host first, then upload
+        const remoteDir = remotePath.substring(0, remotePath.lastIndexOf('/'));
+        const createDirCommand = `ssh "${host}" "mkdir -p '${remoteDir}'"`;
+        const scpCommand = ['scp', ...scpOptions, escapedLocalPath, escapedRemotePath].join(' ');
+        finalCommand = `${createDirCommand} && ${scpCommand}`;
+      } else {
+        finalCommand = ['scp', ...scpOptions, escapedLocalPath, escapedRemotePath].join(' ');
+      }
+      
+      exec(finalCommand, (error, stdout, stderr) => {
         if (error) {
-          reject(new McpError(ErrorCode.InternalError, `SCP upload failed: ${error.message}`));
+          reject(new McpError(ErrorCode.InternalError, `SCP upload failed: Command failed: ${finalCommand}\nError: ${error.message}`));
           return;
         }
 
@@ -664,8 +797,12 @@ class SSHMCPServer {
                 host,
                 localPath,
                 remotePath,
+                recursive,
+                preservePermissions,
+                createDirectories,
                 success: true,
-                message: 'File uploaded successfully',
+                message: recursive ? 'Directory uploaded successfully' : 'File uploaded successfully',
+                command: finalCommand,
                 stdout: stdout.trim(),
                 stderr: stderr.trim(),
               }, null, 2),
@@ -676,15 +813,50 @@ class SSHMCPServer {
     });
   }
 
-  private async downloadFile(host: string, remotePath: string, localPath: string): Promise<any> {
+  private async downloadFile(
+    host: string, 
+    remotePath: string, 
+    localPath: string, 
+    recursive: boolean = false, 
+    preservePermissions: boolean = true,
+    createDirectories: boolean = true
+  ): Promise<any> {
     const hostConfig = this.validateHostAccess(host);
 
     return new Promise((resolve, reject) => {
-      const scpCommand = `scp "${host}:${remotePath}" "${localPath}"`;
+      // Build SCP command with proper options and escaping
+      let scpOptions = [];
       
-      exec(scpCommand, (error, stdout, stderr) => {
+      if (recursive) {
+        scpOptions.push('-r');
+      }
+      
+      if (preservePermissions) {
+        scpOptions.push('-p');
+      }
+      
+      // Add compression for better performance over slower connections
+      scpOptions.push('-C');
+      
+      // Properly escape paths that might contain spaces or special characters
+      const escapedRemotePath = `"${host}:${remotePath.replace(/"/g, '\\"')}"`;
+      const escapedLocalPath = `"${localPath.replace(/"/g, '\\"')}"`;
+      
+      let finalCommand: string;
+      
+      if (createDirectories) {
+        // Create parent directory locally first, then download
+        const localDir = localPath.substring(0, localPath.lastIndexOf('/'));
+        const createDirCommand = `mkdir -p "${localDir}"`;
+        const scpCommand = ['scp', ...scpOptions, escapedRemotePath, escapedLocalPath].join(' ');
+        finalCommand = `${createDirCommand} && ${scpCommand}`;
+      } else {
+        finalCommand = ['scp', ...scpOptions, escapedRemotePath, escapedLocalPath].join(' ');
+      }
+      
+      exec(finalCommand, (error, stdout, stderr) => {
         if (error) {
-          reject(new McpError(ErrorCode.InternalError, `SCP download failed: ${error.message}`));
+          reject(new McpError(ErrorCode.InternalError, `SCP download failed: Command failed: ${finalCommand}\nError: ${error.message}`));
           return;
         }
 
@@ -696,8 +868,12 @@ class SSHMCPServer {
                 host,
                 remotePath,
                 localPath,
+                recursive,
+                preservePermissions,
+                createDirectories,
                 success: true,
-                message: 'File downloaded successfully',
+                message: recursive ? 'Directory downloaded successfully' : 'File downloaded successfully',
+                command: finalCommand,
                 stdout: stdout.trim(),
                 stderr: stderr.trim(),
               }, null, 2),
@@ -964,6 +1140,110 @@ class SSHMCPServer {
 
       child.on('error', (error) => {
         reject(new McpError(ErrorCode.InternalError, `SSH append to file failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async bulkTransfer(
+    host: string,
+    direction: string,
+    remotePath: string,
+    localPath: string,
+    compression: string = 'gzip',
+    preservePermissions: boolean = true,
+    excludePatterns: string[] = [],
+    createDirectories: boolean = true
+  ): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    return new Promise((resolve, reject) => {
+      // Determine compression flags
+      let tarFlags = 'f';
+      let compressFlag = '';
+      
+      switch (compression) {
+        case 'gzip':
+          compressFlag = 'z';
+          break;
+        case 'bzip2':
+          compressFlag = 'j';
+          break;
+        case 'xz':
+          compressFlag = 'J';
+          break;
+        case 'none':
+          compressFlag = '';
+          break;
+        default:
+          compressFlag = 'z'; // Default to gzip
+      }
+
+      // Add preservation flag if requested
+      if (preservePermissions) {
+        tarFlags += 'p';
+      }
+
+      // Build exclude arguments
+      const excludeArgs = excludePatterns.map(pattern => `--exclude="${pattern}"`).join(' ');
+
+      let command: string;
+      let workingDir: string;
+
+      if (direction === 'download') {
+        // Download: ssh host "cd remote && tar czf - ." | tar xzf - -C local
+        if (createDirectories) {
+          workingDir = localPath;
+          // Create local directory first
+          command = `mkdir -p "${localPath}" && ssh "${host}" "cd '${remotePath}' && tar c${compressFlag}${tarFlags} - ${excludeArgs} ." | tar x${compressFlag}${tarFlags} - -C "${localPath}"`;
+        } else {
+          command = `ssh "${host}" "cd '${remotePath}' && tar c${compressFlag}${tarFlags} - ${excludeArgs} ." | tar x${compressFlag}${tarFlags} - -C "${localPath}"`;
+        }
+      } else if (direction === 'upload') {
+        // Upload: tar czf - -C local . | ssh host "cd remote && tar xzf -"
+        if (createDirectories) {
+          command = `tar c${compressFlag}${tarFlags} - ${excludeArgs} -C "${localPath}" . | ssh "${host}" "mkdir -p '${remotePath}' && cd '${remotePath}' && tar x${compressFlag}${tarFlags} -"`;
+        } else {
+          command = `tar c${compressFlag}${tarFlags} - ${excludeArgs} -C "${localPath}" . | ssh "${host}" "cd '${remotePath}' && tar x${compressFlag}${tarFlags} -"`;
+        }
+      } else {
+        reject(new McpError(ErrorCode.InvalidRequest, `Invalid direction: ${direction}. Must be 'download' or 'upload'.`));
+        return;
+      }
+
+      const startTime = Date.now();
+      
+      exec(command, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
+        const endTime = Date.now();
+        const duration = endTime - startTime;
+
+        if (error) {
+          reject(new McpError(ErrorCode.InternalError, `Bulk transfer failed: Command failed: ${command}\nError: ${error.message}\nStderr: ${stderr}`));
+          return;
+        }
+
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                direction,
+                remotePath,
+                localPath,
+                compression,
+                preservePermissions,
+                excludePatterns,
+                createDirectories,
+                success: true,
+                message: `Bulk ${direction} completed successfully`,
+                command: command,
+                duration: `${duration}ms`,
+                stdout: stdout.trim(),
+                stderr: stderr.trim(),
+              }, null, 2),
+            },
+          ],
+        });
       });
     });
   }

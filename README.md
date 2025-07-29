@@ -17,11 +17,13 @@ An MCP (Model Context Protocol) server that enables SSH remote command execution
 - **Timeout Protection**: Configurable timeouts prevent hanging connections
 
 ### File Operations
-- **Upload Files**: Transfer files to remote hosts via SCP
-- **Download Files**: Retrieve files from remote hosts
+- **Upload Files**: Transfer files and directories to remote hosts via SCP
+- **Download Files**: Retrieve files and directories from remote hosts
+- **Bulk Transfer**: High-performance directory transfers using tar streaming
 - **Edit Files**: Line-based editing with replace, insert, and delete operations
 - **Rewrite Files**: Complete file content replacement with backup support
 - **Append to Files**: Add content to the end of files
+- **Auto Directory Creation**: Automatically creates parent directories
 - **Secure Transfer**: Uses your existing SSH keys and security settings
 - **Base64 Content Handling**: Safe handling of special characters and multi-line content
 
@@ -96,6 +98,8 @@ Once configured, you can use natural language commands with Claude Desktop:
 "Update the sensor threshold values across all my IoT devices"
 "Deploy the latest firmware to all Raspberry Pi sensors"
 "Backup all Odoo databases and compress the files"
+"Download entire nginx config directory from production server"
+"Upload my entire project folder to the development server"
 ```
 
 ### SSH Config Example
@@ -194,26 +198,95 @@ Get detailed information about a specific host:
 ```
 
 ### 5. ssh_upload_file
-Upload files to remote hosts:
+Upload files or directories to remote hosts with automatic directory creation:
 
+**Single file upload:**
 ```json
 {
   "host": "odoo-dev",
   "localPath": "/Users/dgoo2308/my-addon.zip",
-  "remotePath": "/opt/odoo/addons/my-addon.zip"
+  "remotePath": "/opt/odoo/addons/my-addon.zip",
+  "createDirectories": true,
+  "preservePermissions": true
+}
+```
+
+**Directory upload (recursive):**
+```json
+{
+  "host": "rpi-sensor-1",
+  "localPath": "/Users/dgoo2308/iot-configs",
+  "remotePath": "/etc/iot-configs",
+  "recursive": true,
+  "createDirectories": true,
+  "preservePermissions": true
 }
 ```
 
 ### 6. ssh_download_file
-Download files from remote hosts:
+Download files or directories from remote hosts with automatic directory creation:
 
+**Single file download:**
 ```json
 {
   "host": "rpi-sensor-1",
   "remotePath": "/var/log/sensor.log",
-  "localPath": "/Users/dgoo2308/Downloads/sensor.log"
+  "localPath": "/Users/dgoo2308/Downloads/sensor.log",
+  "createDirectories": true,
+  "preservePermissions": true
 }
 ```
+
+**Directory download (recursive):**
+```json
+{
+  "host": "odoo-prod",
+  "remotePath": "/etc/nginx/conf.d",
+  "localPath": "/Users/dgoo2308/backups/nginx-config",
+  "recursive": true,
+  "createDirectories": true,
+  "preservePermissions": true
+}
+```
+
+### 6.1. ssh_bulk_transfer ⚡ NEW!
+Ultra-efficient directory transfers using tar streaming - perfect for large directories with many files:
+
+**Download entire directory structure:**
+```json
+{
+  "host": "vct_remote_root",
+  "direction": "download",
+  "remotePath": "/etc/nginx/conf.d",
+  "localPath": "/Volumes/DG1T Media/vct_remote/nginx_conf_bulk",
+  "compression": "gzip",
+  "preservePermissions": true,
+  "createDirectories": true,
+  "excludePatterns": ["*.log", "*.tmp", ".git"]
+}
+```
+
+**Upload entire project to server:**
+```json
+{
+  "host": "odoo-prod",
+  "direction": "upload",
+  "localPath": "/Users/dgoo2308/my-odoo-addon",
+  "remotePath": "/opt/odoo/addons/my-addon",
+  "compression": "gzip",
+  "preservePermissions": true,
+  "createDirectories": true,
+  "excludePatterns": ["__pycache__", "*.pyc", ".git"]
+}
+```
+
+**Bulk transfer benefits:**
+- ⚡ **10x faster** than SCP for directories with many small files
+- 🗜️ **Built-in compression** (gzip, bzip2, xz, or none)
+- 🔄 **Single SSH connection** instead of multiple SCP calls
+- 📁 **Preserves symlinks, permissions, timestamps**
+- 🚫 **Exclude patterns** support (like rsync)
+- 📊 **Transfer duration** reporting
 
 ### 7. ssh_edit_file
 Edit specific lines in files using reliable sed commands with regex pattern support:
