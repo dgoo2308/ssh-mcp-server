@@ -31,16 +31,22 @@ interface ServerFilter {
   disallow: string[];
 }
 
+interface CommandFilter {
+  allow: string[];
+  disallow: string[];
+}
+
 class SSHMCPServer {
   private server: Server;
   private sshHosts: Map<string, SSHHost> = new Map();
   private serverFilter: ServerFilter;
+  private commandFilter: CommandFilter;
 
   constructor() {
     this.server = new Server(
       {
         name: 'ssh-remote-commands',
-        version: '0.2.0',
+        version: '0.4.0',
       },
       {
         capabilities: {
@@ -50,6 +56,7 @@ class SSHMCPServer {
     );
 
     this.serverFilter = this.loadServerFilter();
+    this.commandFilter = this.loadCommandFilter();
     this.setupToolHandlers();
     this.setupErrorHandling();
   }
@@ -179,7 +186,7 @@ class SSHMCPServer {
       tools: [
         {
           name: 'ssh_execute_command',
-          description: 'Execute a command on a remote host via SSH using your SSH config',
+          description: 'Execute a command on a remote host via SSH using your SSH config (with command filtering for security)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -207,7 +214,7 @@ class SSHMCPServer {
         },
         {
           name: 'ssh_execute_script',
-          description: 'Execute a multi-line script on a remote host via SSH with base64 encoding',
+          description: 'Execute a multi-line script on a remote host via SSH with base64 encoding (with command filtering for security)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -593,6 +600,12 @@ class SSHMCPServer {
   private async executeCommand(host: string, command: string, timeout: number, useBase64: boolean = false): Promise<any> {
     const hostConfig = this.validateHostAccess(host);
 
+    // Check if command is allowed
+    const commandCheck = this.isCommandAllowed(command);
+    if (!commandCheck.allowed) {
+      throw new McpError(ErrorCode.InvalidRequest, commandCheck.reason || 'Command not allowed');
+    }
+
     let finalCommand: string;
     
     if (useBase64) {
@@ -653,6 +666,19 @@ class SSHMCPServer {
 
   private async executeScript(host: string, script: string, timeout: number, interpreter: string = 'bash'): Promise<any> {
     const hostConfig = this.validateHostAccess(host);
+
+    // Check if script content is allowed
+    // For scripts, we check each line that looks like a command
+    const scriptLines = script.split('\n').map(line => line.trim()).filter(line => 
+      line && !line.startsWith('#') && !line.startsWith('echo ') // Skip comments and echo statements
+    );
+    
+    for (const line of scriptLines) {
+      const commandCheck = this.isCommandAllowed(line);
+      if (!commandCheck.allowed) {
+        throw new McpError(ErrorCode.InvalidRequest, `Script contains disallowed command: "${line}". ${commandCheck.reason}`);
+      }
+    }
 
     // Always use base64 for scripts to handle multi-line content safely
     const encodedScript = Buffer.from(script).toString('base64');
@@ -1307,6 +1333,115 @@ class SSHMCPServer {
       console.warn('Error parsing server filter environment variables:', error);
       return defaultFilter;
     }
+  }
+
+  private loadCommandFilter(): CommandFilter {
+    const defaultDangerousCommands = [
+      'rm *',
+      'rm -rf *',
+      'rm -rf /',
+      'dd if=*',
+      'mkfs.*',
+      'fdisk',
+      'parted',
+      'shutdown.*',
+      'reboot.*',
+      'halt.*',
+      'poweroff.*',
+      'init 0',
+      'init 6',
+      'killall.*',
+      'pkill.*',
+      'chmod 777 *',
+      'chown -R * /',
+      'find .* -delete',
+      'find .* -exec rm',
+      '> /dev/sd.*',
+      'cat /dev/urandom >',
+      'fork.*bomb',
+      ':(){ :|:& };:',
+      'history -c',
+      'unset HISTFILE'
+    ];
+    
+    const defaultFilter: CommandFilter = { 
+      allow: [], 
+      disallow: defaultDangerousCommands 
+    };
+    
+    try {
+      const allowEnv = process.env.SSH_MCP_COMMAND_ALLOW;
+      const disallowEnv = process.env.SSH_MCP_COMMAND_DISALLOW;
+      
+      const allow = allowEnv ? JSON.parse(allowEnv) : [];
+      const disallow = disallowEnv ? JSON.parse(disallowEnv) : defaultDangerousCommands;
+      
+      if (!Array.isArray(allow)) {
+        console.warn('SSH_MCP_COMMAND_ALLOW must be a JSON array, using empty array');
+        return { allow: [], disallow: Array.isArray(disallow) ? disallow : defaultDangerousCommands };
+      }
+      
+      if (!Array.isArray(disallow)) {
+        console.warn('SSH_MCP_COMMAND_DISALLOW must be a JSON array, using defaults');
+        return { allow, disallow: defaultDangerousCommands };
+      }
+      
+      console.error(`Command filter loaded - Allow: ${allow.length} patterns, Disallow: ${disallow.length} patterns`);
+      return { allow, disallow };
+    } catch (error) {
+      console.warn('Error parsing command filter environment variables:', error);
+      return defaultFilter;
+    }
+  }
+
+  private matchesCommandPattern(command: string, pattern: string): boolean {
+    // Convert wildcard pattern to regex for command matching
+    // More flexible than hostname matching to catch dangerous command variations
+    const escapedPattern = pattern
+      .replace(/[.+^${}()|[\]\\]/g, '\\$&')  // Escape regex special chars except * and ?
+      .replace(/\*/g, '.*')  // Convert * to .*
+      .replace(/\?/g, '.');   // Convert ? to .
+    
+    const regex = new RegExp(escapedPattern, 'i'); // Case insensitive for commands
+    return regex.test(command.trim());
+  }
+
+  private isCommandAllowed(command: string): { allowed: boolean; reason?: string } {
+    const { allow, disallow } = this.commandFilter;
+    
+    // Clean the command - remove extra whitespace and get the base command
+    const cleanCommand = command.trim().replace(/\s+/g, ' ');
+    
+    // Check disallow list first (takes precedence)
+    for (const pattern of disallow) {
+      if (this.matchesCommandPattern(cleanCommand, pattern)) {
+        console.error(`Command '${cleanCommand}' blocked by disallow pattern: '${pattern}'`);
+        return { 
+          allowed: false, 
+          reason: `Command blocked by security policy. Matches disallowed pattern: '${pattern}'` 
+        };
+      }
+    }
+    
+    // If allow list is empty, allow by default (only disallow list applies)
+    if (allow.length === 0) {
+      return { allowed: true };
+    }
+    
+    // Check allow list
+    for (const pattern of allow) {
+      if (this.matchesCommandPattern(cleanCommand, pattern)) {
+        console.error(`Command '${cleanCommand}' allowed by pattern: '${pattern}'`);
+        return { allowed: true };
+      }
+    }
+    
+    // If allow list exists but no patterns match, deny
+    console.error(`Command '${cleanCommand}' not allowed - no matching allow patterns`);
+    return { 
+      allowed: false, 
+      reason: 'Command not in allowed list. Use SSH_MCP_COMMAND_ALLOW to permit specific commands.' 
+    };
   }
 
   private matchesPattern(hostname: string, pattern: string): boolean {

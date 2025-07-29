@@ -1,6 +1,6 @@
 # SSH Remote Commands MCP Server
 
-An MCP (Model Context Protocol) server that enables SSH remote command execution using your existing SSH config, with advanced base64 encoding support for complex commands and scripts. Perfect for managing IoT devices and remote Odoo deployments without escaping headaches!
+An MCP (Model Context Protocol) server that enables SSH remote command execution using your existing SSH config, with advanced base64 encoding support and built-in security filtering. Perfect for managing IoT devices and remote Odoo deployments safely without escaping headaches!
 
 ## 🚀 Features
 
@@ -9,6 +9,7 @@ An MCP (Model Context Protocol) server that enables SSH remote command execution
 - **Include Support**: Handles SSH config `Include` directives seamlessly
 - **Host Management**: List and inspect all configured SSH hosts
 - **Base64 Encoding**: Eliminates command escaping issues entirely
+- **Security Filtering**: Built-in command filtering prevents dangerous operations
 
 ### Command Execution
 - **Simple Commands**: Execute basic commands with optional base64 encoding
@@ -60,7 +61,9 @@ Add this to your Claude Desktop `claude_desktop_config.json`:
     "ssh-remote-commands": {
       "command": "node",
       "args": ["/Users/dgoo2308/git/ssh_mcp/build/index.js"],
-      "env": {}
+      "env": {
+        "SSH_MCP_COMMAND_DISALLOW": "[\"rm *\", \"rm -rf *\", \"shutdown.*\"]"
+      }
     }
   }
 }
@@ -145,6 +148,118 @@ Host bastion.example.com
     User admin
     IdentityFile ~/.ssh/id_rsa_bastion
     ServerAliveInterval 60
+```
+
+## 🔒 Security Configuration
+
+The SSH MCP server includes built-in security filtering to prevent dangerous command execution. Commands are filtered using configurable allow/disallow lists.
+
+### Default Security Settings
+
+By default, these dangerous commands are **blocked**:
+
+```bash
+# Destructive file operations
+rm *, rm -rf *, rm -rf /
+find .* -delete, find .* -exec rm
+
+# System operations  
+shutdown.*, reboot.*, halt.*, poweroff.*
+init 0, init 6
+
+# Disk operations
+dd if=*, mkfs.*, fdisk, parted
+> /dev/sd.*
+
+# Process operations
+killall.*, pkill.*
+
+# Permission changes
+chmod 777 *, chown -R * /
+
+# Fork bombs and malicious patterns
+:(){ :|:& };:, fork.*bomb
+
+# History manipulation
+history -c, unset HISTFILE
+```
+
+### Environment Variables
+
+Configure command filtering using these environment variables:
+
+**`SSH_MCP_COMMAND_DISALLOW`** - JSON array of command patterns to block:
+```json
+[
+  "rm *",
+  "rm -rf *", 
+  "shutdown.*",
+  "reboot.*",
+  "dd if=*"
+]
+```
+
+**`SSH_MCP_COMMAND_ALLOW`** - JSON array of command patterns to explicitly allow:
+```json
+[
+  "systemctl *",
+  "docker *",
+  "git *",
+  "npm *",
+  "python *"
+]
+```
+
+### Pattern Matching
+
+Command patterns support wildcards:
+- `*` matches any characters
+- `?` matches single character  
+- Patterns are case-insensitive
+- `rm *` blocks `rm file.txt`, `RM -RF /home`, etc.
+
+### Configuration Examples
+
+**Restrictive (allow-list only):**
+```json
+{
+  "env": {
+    "SSH_MCP_COMMAND_ALLOW": "[\"systemctl status *\", \"docker ps\", \"git status\"]",
+    "SSH_MCP_COMMAND_DISALLOW": "[\"rm *\", \"shutdown.*\"]"
+  }
+}
+```
+
+**Permissive (block dangerous only):**
+```json
+{
+  "env": {
+    "SSH_MCP_COMMAND_DISALLOW": "[\"rm -rf *\", \"shutdown.*\", \"dd if=*\"]"
+  }
+}
+```
+
+**Development environment (minimal restrictions):**
+```json
+{
+  "env": {
+    "SSH_MCP_COMMAND_DISALLOW": "[\"rm -rf /\", \"shutdown.*\"]"
+  }
+}
+```
+
+### Host Access Filtering
+
+You can also restrict which SSH hosts can be accessed:
+
+**`SSH_MCP_ALLOW`** - JSON array of host patterns to allow:
+```json
+["*.example.com", "dev-*", "staging-server"]
+```
+
+**`SSH_MCP_DISALLOW`** - JSON array of host patterns to block:
+```json
+["prod-*", "*.internal"]
 ```
 
 ## 🔧 Available Tools
@@ -457,11 +572,16 @@ Append content to files:
 
 ## 🔐 Security Features
 
+- **Command Filtering**: Built-in allow/disallow lists prevent dangerous commands
+- **Pattern Matching**: Flexible wildcard patterns catch command variations
+- **Default Protection**: Blocks destructive operations like `rm *`, `shutdown`, disk formatting
+- **Host Filtering**: Restrict access to specific SSH hosts with patterns
 - **SSH Key Management**: Uses your existing SSH keys and security settings
 - **Config Respect**: Honors all SSH config directives (ProxyJump, IdentityFile, etc.)
 - **No Credential Storage**: Never stores or transmits SSH credentials
 - **Timeout Protection**: Prevents runaway processes with configurable timeouts
 - **Base64 Safety**: Eliminates injection risks through command escaping
+- **Script Validation**: Multi-line scripts are validated line-by-line
 
 ## 🧠 Base64 Encoding Strategy
 
@@ -646,7 +766,15 @@ Error: Command timed out after 30 seconds
 - Check network connectivity
 - Verify SSH service is running on target host
 
-**4. Base64 Not Found**
+**4. Command Blocked by Security Filter**
+```
+Error: Command blocked by security policy. Matches disallowed pattern: 'rm *'
+```
+- The command matches a security pattern in `SSH_MCP_COMMAND_DISALLOW`
+- Add command to `SSH_MCP_COMMAND_ALLOW` if needed
+- Check the Security Configuration section above
+
+**5. Base64 Not Found**
 ```
 Error: base64: command not found
 ```

@@ -1,6 +1,6 @@
 {
   "name": "ssh-remote-commands-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server for SSH remote commands with SSH config integration and base64 encoding",
   "type": "module",
   "main": "build/index.js",
