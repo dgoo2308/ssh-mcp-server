@@ -655,6 +655,234 @@ List systemd timers and their status:
 - Backup schedules
 - Custom application timers
 
+### 16. ssh_systemctl ⚡ NEW!
+Control systemd services with comprehensive service management:
+
+**Start a service:**
+```json
+{
+  "host": "odoo-prod",
+  "action": "start",
+  "service": "nginx",
+  "followStatus": true
+}
+```
+
+**Stop a service:**
+```json
+{
+  "host": "odoo-prod",
+  "action": "stop",
+  "service": "postgresql",
+  "followStatus": true
+}
+```
+
+**Restart Odoo service:**
+```json
+{
+  "host": "odoo-prod",
+  "action": "restart",
+  "service": "odoo",
+  "followStatus": true
+}
+```
+
+**Check service status:**
+```json
+{
+  "host": "odoo-prod",
+  "action": "status",
+  "service": "nginx",
+  "followStatus": true
+}
+```
+
+**Enable service at boot:**
+```json
+{
+  "host": "odoo-prod",
+  "action": "enable",
+  "service": "postgresql",
+  "followStatus": true
+}
+```
+
+**Available actions:**
+- `start` - Start the service
+- `stop` - Stop the service  
+- `restart` - Restart the service
+- `reload` - Reload service configuration
+- `status` - Show detailed service status
+- `enable` - Enable service at boot
+- `disable` - Disable service at boot
+- `mask` - Mask the service (prevent it from being started)
+- `unmask` - Unmask the service
+
+**Response includes:**
+- Service action success/failure status
+- Detailed service status (load state, active state, sub-state)
+- Main process PID if running
+- Complete systemctl output
+- Parsed service information for easy consumption
+
+### 17. ssh_journalctl ⚡ NEW!
+View systemd journal logs with advanced filtering and time options:
+
+**Get recent logs for a service:**
+```json
+{
+  "host": "odoo-prod",
+  "service": "nginx",
+  "since": "2 minutes ago",
+  "lines": 50
+}
+```
+
+**Get error logs only:**
+```json
+{
+  "host": "odoo-prod", 
+  "service": "odoo",
+  "since": "1 hour ago",
+  "priority": "err",
+  "lines": 100
+}
+```
+
+**Get logs for specific time range:**
+```json
+{
+  "host": "odoo-prod",
+  "service": "postgresql",
+  "since": "2024-01-15 09:00:00",
+  "until": "2024-01-15 17:00:00",
+  "lines": 200
+}
+```
+
+**Follow logs in real-time (limited time):**
+```json
+{
+  "host": "odoo-prod",
+  "service": "nginx",
+  "follow": true,
+  "timeout": 30
+}
+```
+
+**Get system-wide logs:**
+```json
+{
+  "host": "odoo-prod",
+  "since": "today",
+  "priority": "warning",
+  "lines": 100
+}
+```
+
+**Time format examples:**
+- `"2 minutes ago"` - Relative time
+- `"1 hour ago"` - Relative time
+- `"today"` - Start of current day
+- `"yesterday"` - Start of previous day
+- `"2024-01-15 12:00:00"` - Absolute timestamp
+- `"2024-01-15"` - Start of specific date
+
+**Priority levels:**
+- `emerg` - Emergency (system unusable)
+- `alert` - Alert (action must be taken immediately)
+- `crit` - Critical conditions
+- `err` - Error conditions
+- `warning` - Warning conditions
+- `notice` - Normal but significant conditions
+- `info` - Informational messages
+- `debug` - Debug-level messages
+
+**Response includes:**
+- Parsed log entries with timestamps and content
+- Total number of log entries retrieved
+- Complete raw journalctl output
+- Success/failure status
+- Filtering parameters used
+
+### 18. ssh_service_logs ⚡ NEW!
+Quick access to service logs with smart defaults for common patterns:
+
+**Get recent logs (default pattern):**
+```json
+{
+  "host": "odoo-prod",
+  "service": "odoo",
+  "pattern": "recent",
+  "timeRange": "5m",
+  "lines": 100
+}
+```
+
+**Get error logs only:**
+```json
+{
+  "host": "odoo-prod",
+  "service": "postgresql",
+  "pattern": "errors",
+  "timeRange": "1h",
+  "lines": 50
+}
+```
+
+**Get startup logs:**
+```json
+{
+  "host": "odoo-prod",
+  "service": "nginx",
+  "pattern": "startup",
+  "lines": 200
+}
+```
+
+**Get all logs for today:**
+```json
+{
+  "host": "odoo-prod",
+  "service": "odoo",
+  "pattern": "all",
+  "lines": 500
+}
+```
+
+**Available patterns:**
+- `recent` - Recent logs within specified time range (default: 5 minutes)
+- `errors` - Error-level logs and above within time range
+- `startup` - Logs since last service start (captures startup sequence)
+- `all` - All logs for today (useful for comprehensive analysis)
+
+**Smart defaults by pattern:**
+- `recent`: Shows logs from last 5 minutes, 100 lines max
+- `errors`: Shows error-level logs, filters for error keywords
+- `startup`: Shows logs from today, 200 lines to capture startup sequence
+- `all`: Shows logs from today, 500 lines minimum for comprehensive view
+
+**Analysis features:**
+- Error counting for `errors` pattern (shows number of actual error messages)
+- Startup detection for `startup` pattern (shows if recent startup activity found)
+- Smart keyword filtering for relevant log entries
+- Convenience mode flag for easy identification
+
+**Time range examples:**
+- `"2m"` - Last 2 minutes
+- `"5m"` - Last 5 minutes (default)
+- `"1h"` - Last 1 hour
+- `"today"` - Since start of today
+- `"1d"` - Last 24 hours
+
+**Perfect for:**
+- Quick troubleshooting: `ssh_service_logs` with `errors` pattern
+- Service monitoring: `ssh_service_logs` with `recent` pattern
+- Startup debugging: `ssh_service_logs` with `startup` pattern
+- Comprehensive analysis: `ssh_service_logs` with `all` pattern
+- Integration with monitoring systems and dashboards
+
 ## 🎯 Use Cases
 
 ### Odoo Development & Operations
@@ -665,14 +893,29 @@ List systemd timers and their status:
 # Check service status
 "Check if Odoo is running on odoo-prod"
 
+# Service management with systemctl
+"Restart the Odoo service on odoo-prod"
+"Stop PostgreSQL service temporarily on odoo-dev"
+"Enable nginx service at boot on all servers"
+"Check detailed status of all running services"
+
+# Advanced log analysis with journalctl
+"Show error logs from Odoo service in the last hour"
+"Get PostgreSQL startup logs from this morning"
+"Follow nginx access logs in real-time for 2 minutes"
+"Show all systemd logs with warning priority from today"
+
+# Quick troubleshooting with service logs
+"Get recent error logs from odoo service"
+"Show startup sequence logs for postgresql"
+"Check all logs from nginx service today"
+
 # Database operations
 "Execute a database backup script on odoo-prod"
 
-# Log analysis
-"Get the last 100 lines of Odoo logs from odoo-prod"
-
 # Performance monitoring
 "Show CPU and memory usage on odoo-prod"
+"List all systemd timers and their schedules"
 
 # Configuration management
 "Update worker count in Odoo config file"

@@ -46,7 +46,7 @@ class SSHMCPServer {
     this.server = new Server(
       {
         name: 'ssh-remote-commands',
-        version: '0.4.0',
+        version: '0.6.0',
       },
       {
         capabilities: {
@@ -583,7 +583,7 @@ class SSHMCPServer {
         },
         {
           name: 'ssh_list_services',
-          description: 'List systemd services and their status',
+          description: 'List systemd services and their status with smart filtering to show only useful services by default (running apps, failed services, etc.). Use showAll=true to see all services.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -597,7 +597,7 @@ class SSHMCPServer {
               },
               showAll: {
                 type: 'boolean',
-                description: 'Show all services including inactive ones (default: false)',
+                description: 'Show all services including system/maintenance services (default: false - shows only useful services)',
                 default: false,
               },
             },
@@ -621,6 +621,114 @@ class SSHMCPServer {
               },
             },
             required: ['host'],
+          },
+        },
+        {
+          name: 'ssh_systemctl',
+          description: 'Control systemd services with comprehensive service management',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              action: {
+                type: 'string',
+                enum: ['start', 'stop', 'restart', 'reload', 'status', 'enable', 'disable', 'mask', 'unmask'],
+                description: 'Systemctl action to perform',
+              },
+              service: {
+                type: 'string',
+                description: 'Service name (e.g., nginx, odoo, postgresql)',
+              },
+              followStatus: {
+                type: 'boolean',
+                description: 'Show detailed status after performing action (default: true)',
+                default: true,
+              },
+            },
+            required: ['host', 'action', 'service'],
+          },
+        },
+        {
+          name: 'ssh_journalctl',
+          description: 'View systemd journal logs with advanced filtering and time options',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              service: {
+                type: 'string',
+                description: 'Filter logs for specific service (optional)',
+              },
+              since: {
+                type: 'string',
+                description: 'Show logs since this time (e.g., "2 minutes ago", "1 hour ago", "today", "2024-09-02 12:00:00")',
+              },
+              until: {
+                type: 'string',
+                description: 'Show logs until this time (same format as since)',
+              },
+              lines: {
+                type: 'number',
+                description: 'Number of recent log lines to show (default: 50)',
+                default: 50,
+              },
+              priority: {
+                type: 'string',
+                enum: ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug'],
+                description: 'Show logs at this priority level and above',
+              },
+              follow: {
+                type: 'boolean',
+                description: 'Follow logs in real-time (default: false)',
+                default: false,
+              },
+              timeout: {
+                type: 'number',
+                description: 'Timeout for follow mode in seconds (default: 30)',
+                default: 30,
+              },
+            },
+            required: ['host'],
+          },
+        },
+        {
+          name: 'ssh_service_logs',
+          description: 'Quick access to service logs with smart defaults for common patterns',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              service: {
+                type: 'string',
+                description: 'Service name to get logs for',
+              },
+              pattern: {
+                type: 'string',
+                enum: ['recent', 'errors', 'startup', 'all'],
+                description: 'Log pattern to show (default: recent)',
+                default: 'recent',
+              },
+              timeRange: {
+                type: 'string',
+                description: 'Time range for logs (e.g., "2m", "5m", "1h", "today")',
+                default: '5m',
+              },
+              lines: {
+                type: 'number',
+                description: 'Maximum number of lines to return (default: 100)',
+                default: 100,
+              },
+            },
+            required: ['host', 'service'],
           },
         },
       ],
@@ -757,6 +865,35 @@ class SSHMCPServer {
             return await this.listTimers(
               args.host as string,
               (args.showAll as boolean) ?? false
+            );
+          
+          case 'ssh_systemctl':
+            return await this.systemctl(
+              args.host as string,
+              args.action as string,
+              args.service as string,
+              (args.followStatus as boolean) ?? true
+            );
+          
+          case 'ssh_journalctl':
+            return await this.journalctl(
+              args.host as string,
+              args.service as string,
+              args.since as string,
+              args.until as string,
+              (args.lines as number) ?? 50,
+              args.priority as string,
+              (args.follow as boolean) ?? false,
+              (args.timeout as number) ?? 30
+            );
+          
+          case 'ssh_service_logs':
+            return await this.serviceLogs(
+              args.host as string,
+              args.service as string,
+              (args.pattern as string) ?? 'recent',
+              (args.timeRange as string) ?? '5m',
+              (args.lines as number) ?? 100
             );
           
           default:
@@ -1732,14 +1869,6 @@ class SSHMCPServer {
       command += ` '${pattern}'`;
     }
     
-    // Add additional status info
-    command += ' && echo "---DETAILED---" && systemctl status --no-pager -l';
-    if (pattern) {
-      command += ` '${pattern}'`;
-    } else {
-      command += ' --all --type=service';
-    }
-
     return new Promise((resolve, reject) => {
       const child = spawn('ssh', [host, command], {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -1761,21 +1890,41 @@ class SSHMCPServer {
         const lines = stdout.split('\n');
         const services = [];
         let inServiceList = false;
-        let detailedSection = false;
         
         for (const line of lines) {
-          if (line.includes('UNIT') && line.includes('LOAD') && line.includes('ACTIVE')) {
+          // Skip empty lines
+          if (!line.trim()) continue;
+          
+          // Find header line
+          if (line.includes('UNIT') && line.includes('LOAD') && line.includes('ACTIVE') && line.includes('SUB')) {
             inServiceList = true;
             continue;
           }
-          if (line.includes('---DETAILED---')) {
-            detailedSection = true;
-            inServiceList = false;
-            continue;
+          
+          // Stop parsing when we hit the footer or end of service list
+          if (inServiceList && (
+              line.includes('loaded units listed') || 
+              line.includes('LOAD   = Reflects') ||
+              line.includes('ACTIVE = The high-level') ||
+              line.includes('SUB    = The low-level') ||
+              line.includes('To show all installed') ||
+              line.match(/^\d+ loaded units listed/) ||
+              line.trim() === '' && services.length > 0  // Empty line after services indicates end
+            )) {
+            break;
           }
-          if (inServiceList && line.trim() && !line.includes('loaded units listed')) {
-            const parts = line.trim().split(/\s+/);
-            if (parts.length >= 4) {
+          
+          if (inServiceList) {
+            // Parse service line
+            const trimmedLine = line.trim();
+            
+            // Skip lines that start with special characters or don't look like service lines
+            if (trimmedLine.startsWith('●') || !trimmedLine.includes('.service')) {
+              continue;
+            }
+            
+            const parts = trimmedLine.split(/\s+/);
+            if (parts.length >= 4 && parts[0].endsWith('.service')) {
               services.push({
                 unit: parts[0],
                 load: parts[1],
@@ -1786,6 +1935,12 @@ class SSHMCPServer {
             }
           }
         }
+        
+        // Filter services for more useful output if not showing all
+        let filteredServices = services;
+        if (!showAll && !pattern) {
+          filteredServices = this.filterUsefulServices(services);
+        }
 
         resolve({
           content: [
@@ -1793,15 +1948,18 @@ class SSHMCPServer {
               type: 'text',
               text: JSON.stringify({
                 host,
-                pattern,
                 showAll,
                 exitCode: code,
                 success: code === 0,
-                services,
-                serviceCount: services.length,
-                rawOutput: stdout.trim(),
-                stderr: stderr.trim(),
-                message: `Found ${services.length} services`,
+                services: filteredServices,
+                serviceCount: filteredServices.length,
+                ...((!showAll && !pattern) ? { 
+                  totalServices: services.length, 
+                  filtered: filteredServices.length < services.length 
+                } : {}),
+                message: !showAll && !pattern 
+                  ? `Found ${filteredServices.length} useful services (${services.length} total)`
+                  : `Found ${filteredServices.length} services`
               }, null, 2),
             },
           ],
@@ -1890,6 +2048,287 @@ class SSHMCPServer {
         reject(new McpError(ErrorCode.InternalError, `SSH list timers failed: ${error.message}`));
       });
     });
+  }
+
+  private async systemctl(host: string, action: string, service: string, followStatus: boolean = true): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Build systemctl command
+    let command = `systemctl ${action} ${service}`;
+    
+    // Add status check after action if requested
+    if (followStatus && !['status'].includes(action)) {
+      command += ` && systemctl status ${service} --no-pager -l`;
+    } else if (action === 'status') {
+      command = `systemctl status ${service} --no-pager -l`;
+    }
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        // Parse service status from output
+        const lines = stdout.split('\n');
+        let serviceState = 'unknown';
+        let activeState = 'unknown';
+        let subState = 'unknown';
+        let mainPid = null;
+        let loadState = 'unknown';
+        
+        for (const line of lines) {
+          if (line.includes('Loaded:')) {
+            const loadMatch = line.match(/Loaded: ([^;]+)/);
+            if (loadMatch) loadState = loadMatch[1].trim();
+          }
+          if (line.includes('Active:')) {
+            const activeMatch = line.match(/Active: ([^\s]+)\s+\(([^)]+)\)/);
+            if (activeMatch) {
+              activeState = activeMatch[1];
+              subState = activeMatch[2];
+            }
+          }
+          if (line.includes('Main PID:')) {
+            const pidMatch = line.match(/Main PID: ([0-9]+)/);
+            if (pidMatch) mainPid = parseInt(pidMatch[1]);
+          }
+        }
+        
+        const actionSuccess = ['start', 'stop', 'restart', 'reload', 'enable', 'disable', 'mask', 'unmask'].includes(action) ? code === 0 : true;
+        const statusSuccess = action === 'status' ? code === 0 : true;
+        
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                service,
+                action,
+                followStatus,
+                exitCode: code,
+                success: actionSuccess && statusSuccess,
+                actionSuccess,
+                serviceStatus: {
+                  loadState,
+                  activeState,
+                  subState,
+                  mainPid,
+                  running: activeState === 'active' && subState === 'running'
+                },
+                stdout: stdout.trim(),
+                stderr: stderr.trim(),
+                message: `Service ${action} ${actionSuccess ? 'completed successfully' : 'failed'}`,
+                timestamp: new Date().toISOString()
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH systemctl failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async journalctl(host: string, service?: string, since?: string, until?: string, lines: number = 50, priority?: string, follow: boolean = false, timeout: number = 30): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Build journalctl command
+    let command = 'journalctl --no-pager';
+    
+    // Add service filter
+    if (service) {
+      command += ` -u ${service}`;
+    }
+    
+    // Add time filters
+    if (since) {
+      command += ` --since="${since}"`;
+    }
+    if (until) {
+      command += ` --until="${until}"`;
+    }
+    
+    // Add priority filter
+    if (priority) {
+      command += ` -p ${priority}`;
+    }
+    
+    // Add line limit
+    if (lines && !follow) {
+      command += ` -n ${lines}`;
+    }
+    
+    // Add follow mode
+    if (follow) {
+      command += ` -f`;
+    }
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+      let logEntries: Array<{timestamp: string | null; content: string}> = [];
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      // Handle timeout for follow mode
+      let timer: NodeJS.Timeout | null = null;
+      if (follow) {
+        timer = setTimeout(() => {
+          child.kill('SIGTERM');
+        }, timeout * 1000);
+      }
+
+      child.on('close', (code) => {
+        if (timer) clearTimeout(timer);
+        
+        // Parse log entries
+        const outputLines = stdout.split('\n').filter(line => line.trim());
+        logEntries = outputLines.slice(0, outputLines.length).map(line => {
+          // Try to parse systemd journal format
+          const timestampMatch = line.match(/^([A-Z][a-z]{2} [0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})/);
+          if (timestampMatch) {
+            return {
+              timestamp: timestampMatch[1],
+              content: line.substring(timestampMatch[1].length).trim()
+            };
+          }
+          return {
+            timestamp: null,
+            content: line
+          };
+        });
+        
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                service,
+                since,
+                until,
+                lines,
+                priority,
+                follow,
+                timeout,
+                exitCode: code,
+                success: code === 0,
+                logEntries: logEntries.slice(-Math.min(lines, logEntries.length)),
+                totalLines: logEntries.length,
+                rawOutput: stdout.trim(),
+                stderr: stderr.trim(),
+                message: follow ? `Followed logs for ${timeout}s` : `Retrieved ${logEntries.length} log entries`,
+                timestamp: new Date().toISOString()
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        if (timer) clearTimeout(timer);
+        reject(new McpError(ErrorCode.InternalError, `SSH journalctl failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async serviceLogs(host: string, service: string, pattern: string = 'recent', timeRange: string = '5m', lines: number = 100): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Determine parameters based on pattern
+    let since: string | undefined;
+    let priority: string | undefined;
+    let actualLines = lines;
+    
+    switch (pattern) {
+      case 'errors':
+        priority = 'err';
+        since = timeRange;
+        break;
+      case 'recent':
+        since = timeRange;
+        break;
+      case 'startup':
+        // Get logs since last service start
+        since = 'today';
+        actualLines = 200; // More lines to capture startup sequence
+        break;
+      case 'all':
+        since = 'today';
+        actualLines = Math.max(lines, 500); // Ensure we get substantial logs
+        break;
+      default:
+        since = timeRange;
+    }
+
+    // Use the journalctl method internally
+    try {
+      const result = await this.journalctl(host, service, since, undefined, actualLines, priority, false, 30);
+      
+      // Parse the result and add pattern-specific analysis
+      const originalData = JSON.parse(result.content[0].text);
+      
+      // Add pattern-specific insights
+      let analysis = {};
+      if (pattern === 'errors') {
+        const errorCount = originalData.logEntries.filter((entry: any) => 
+          entry.content.toLowerCase().includes('error') || 
+          entry.content.toLowerCase().includes('failed') ||
+          entry.content.toLowerCase().includes('critical')
+        ).length;
+        analysis = { errorCount, hasErrors: errorCount > 0 };
+      } else if (pattern === 'startup') {
+        const startupEntries = originalData.logEntries.filter((entry: any) => 
+          entry.content.toLowerCase().includes('start') ||
+          entry.content.toLowerCase().includes('init') ||
+          entry.content.toLowerCase().includes('boot')
+        );
+        analysis = { startupEntries: startupEntries.length, recentStartup: startupEntries.length > 0 };
+      }
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              ...originalData,
+              pattern,
+              timeRange,
+              analysis,
+              convenienceMode: true,
+              message: `Retrieved ${originalData.totalLines} ${pattern} log entries for ${service}`,
+            }, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Service logs failed: ${error}`);
+    }
   }
 
   private loadServerFilter(): ServerFilter {
@@ -2094,6 +2533,127 @@ class SSHMCPServer {
       ErrorCode.InvalidRequest, 
       `Host '${host}' not found in SSH config`
     );
+  }
+
+  private filterUsefulServices(services: any[]): any[] {
+    // Define patterns for services that are typically not useful to see
+    const systemServicePatterns = [
+      /^systemd-/,
+      /^dracut-/,
+      /^initrd-/,
+      /^kmod-/,
+      /^ldconfig/,
+      /^selinux-/,
+      /^import-state/,
+      /^nis-domainname/,
+      /^user-runtime-dir@/,
+      /^getty@/,
+      /^serial-getty@/,
+      /^sshd-keygen@/,
+      /^rc-local/,
+      /^loadmodules/,
+      /^microcode/,
+      /^mdmonitor/,
+      /^irqbalance/,
+      /^cpupower/,
+      /^auth-rpcgss-module/,
+      /^emergency/,
+      /^rescue/,
+      /^cloud-/,        // cloud-init services
+      /^rpc-/,          // RPC services (often not needed)
+      /^user@/,         // user session services
+      /^sssd/,          // system security services daemon (when inactive)
+      /^polkit/,        // authorization manager
+      /^dbus/,          // D-Bus (when not part of critical app services)
+    ];
+    
+    // Filter out services that are:
+    // 1. System maintenance services (based on patterns)
+    // 2. Services with 'exited' state (one-time services)
+    // 3. Failed services that are clearly boot/init related
+    return services.filter(service => {
+      const serviceName = service.unit.toLowerCase();
+      
+      // Skip system services that are typically not interesting
+      if (systemServicePatterns.some(pattern => pattern.test(serviceName))) {
+        return false;
+      }
+      
+      // Skip one-time services that have completed (exited state)
+      // Expanded list of exited services to filter out
+      if (service.sub === 'exited') {
+        const boringExitedServices = [
+          'boot', 'setup', 'init', 'catalog-update', 'random-seed', 
+          'machine-id', 'update-done', 'flush', 'wait-online', 'notify',
+          'firstboot', 'remount', 'modules-load', 'sysctl', 'sysusers',
+          'tmpfiles', 'hwdb-update', 'udev-trigger', 'user-sessions',
+          'fsck', 'import', 'done', 'rebuild'
+        ];
+        
+        if (boringExitedServices.some(keyword => serviceName.includes(keyword))) {
+          return false;
+        }
+      }
+      
+      // Include services that are:
+      // 1. Currently running (active/running)
+      // 2. Failed (need attention)
+      // 3. Application services (nginx, postgresql, etc.)
+      return (
+        (service.active === 'active' && service.sub === 'running') ||
+        service.active === 'failed' ||
+        this.isApplicationService(serviceName)
+      );
+    });
+  }
+  
+  private isApplicationService(serviceName: string): boolean {
+    // Patterns for common application services that are always interesting
+    const applicationPatterns = [
+      /nginx/,
+      /apache/,
+      /httpd/,
+      /mysql/,
+      /postgresql/,
+      /redis/,
+      /mongodb/,
+      /docker/,
+      /ssh[^d-keygen]/,  // sshd but not sshd-keygen
+      /ftp/,
+      /smtp/,
+      /mail/,
+      /dns/,
+      /bind/,
+      /named/,
+      /dhcp/,
+      /nfs/,
+      /smb/,
+      /cron/,
+      /rsyslog/,
+      /auditd/,
+      /fail2ban/,
+      /firewall/,
+      /iptables/,
+      /ufw/,
+      /odoo/,
+      /gunicorn/,
+      /uwsgi/,
+      /celery/,
+      /node/,
+      /pm2/,
+      /jenkins/,
+      /tomcat/,
+      /elastic/,
+      /kibana/,
+      /grafana/,
+      /prometheus/,
+      /influxdb/,
+      /rabbitmq/,
+      /kafka/,
+      /zookeeper/
+    ];
+    
+    return applicationPatterns.some(pattern => pattern.test(serviceName));
   }
 
   private setupErrorHandling(): void {
