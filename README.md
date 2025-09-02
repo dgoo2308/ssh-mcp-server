@@ -514,6 +514,147 @@ Append content to files:
 }
 ```
 
+### 10. ssh_read_file ⚡ NEW!
+Read the contents of a file from a remote host:
+
+```json
+{
+  "host": "odoo-prod",
+  "filePath": "/etc/nginx/conf.d/odoo.conf"
+}
+```
+
+**Response includes:**
+- File content as string
+- Content length and line count
+- Success/failure status
+- Error details if file not found
+
+### 11. ssh_diff_file ⚡ NEW!
+Compare content with a remote file and return the diff:
+
+```json
+{
+  "host": "odoo-prod",
+  "filePath": "/etc/nginx/conf.d/odoo.conf",
+  "content": "# Updated nginx configuration\nupstream odoo {\n    server 127.0.0.1:8069;\n}\n\nserver {\n    server_name odoo.example.com;\n    # ... rest of config\n}",
+  "contextLines": 3
+}
+```
+
+**Perfect for:**
+- Validating configuration changes before applying them
+- Comparing local config templates with remote files
+- Reviewing differences between current and proposed content
+- Ensuring file changes are exactly what you expect
+
+### 12. ssh_diff_files ⚡ NEW!
+Compare two files on the remote host and return the diff:
+
+```json
+{
+  "host": "odoo-prod", 
+  "filePath1": "/etc/nginx/conf.d/odoo.conf",
+  "filePath2": "/etc/nginx/conf.d/odoo.conf.backup",
+  "contextLines": 5
+}
+```
+
+**Use cases:**
+- Compare current config with backup
+- Check differences between staging and production configs
+- Validate file changes after updates
+- Compare different versions of configuration files
+
+### 13. ssh_restart_nginx ⚡ NEW!
+Safely restart nginx server with configuration validation:
+
+```json
+{
+  "host": "odoo-prod",
+  "testOnly": false
+}
+```
+
+**Test configuration only:**
+```json
+{
+  "host": "odoo-prod",
+  "testOnly": true
+}
+```
+
+**Safety features:**
+- Always runs `nginx -t` to validate configuration first
+- Attempts graceful reload before full restart
+- Falls back to full restart if reload fails
+- Returns detailed status including config validation results
+- Shows service status after restart to confirm success
+
+### 14. ssh_list_services ⚡ NEW!
+List systemd services and their status:
+
+```json
+{
+  "host": "odoo-prod",
+  "pattern": "nginx*",
+  "showAll": false
+}
+```
+
+**List all active services:**
+```json
+{
+  "host": "odoo-prod",
+  "showAll": false
+}
+```
+
+**List all services including inactive:**
+```json
+{
+  "host": "odoo-prod", 
+  "showAll": true
+}
+```
+
+**Response includes:**
+- Service unit name, load status, active state, sub-state
+- Service description
+- Parsed service count
+- Raw systemctl output for detailed analysis
+
+### 15. ssh_list_timers ⚡ NEW!
+List systemd timers and their status:
+
+```json
+{
+  "host": "odoo-prod",
+  "showAll": false
+}
+```
+
+**Show all timers including inactive:**
+```json
+{
+  "host": "odoo-prod",
+  "showAll": true
+}
+```
+
+**Response includes:**
+- Next run time and time left
+- Last run time and time passed
+- Timer unit name and associated service
+- Complete timer scheduling information
+
+**Perfect for monitoring:**
+- SSL certificate renewal (`certbot-renew.timer`)
+- Log rotation (`logrotate.timer`) 
+- System maintenance tasks
+- Backup schedules
+- Custom application timers
+
 ## 🎯 Use Cases
 
 ### Odoo Development & Operations

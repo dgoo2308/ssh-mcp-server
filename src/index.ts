@@ -490,6 +490,139 @@ class SSHMCPServer {
             required: ['host', 'direction', 'remotePath', 'localPath'],
           },
         },
+        {
+          name: 'ssh_read_file',
+          description: 'Read the contents of a file from a remote host',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Path to the file on the remote host',
+              },
+            },
+            required: ['host', 'filePath'],
+          },
+        },
+        {
+          name: 'ssh_diff_file',
+          description: 'Compare content with a remote file and return the diff',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Path to the remote file to compare against',
+              },
+              content: {
+                type: 'string',
+                description: 'Content to compare with the remote file',
+              },
+              contextLines: {
+                type: 'number',
+                description: 'Number of context lines to show in diff (default: 3)',
+                default: 3,
+              },
+            },
+            required: ['host', 'filePath', 'content'],
+          },
+        },
+        {
+          name: 'ssh_diff_files',
+          description: 'Compare two files on the remote host and return the diff',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              filePath1: {
+                type: 'string',
+                description: 'Path to the first file on the remote host',
+              },
+              filePath2: {
+                type: 'string',
+                description: 'Path to the second file on the remote host',
+              },
+              contextLines: {
+                type: 'number',
+                description: 'Number of context lines to show in diff (default: 3)',
+                default: 3,
+              },
+            },
+            required: ['host', 'filePath1', 'filePath2'],
+          },
+        },
+        {
+          name: 'ssh_restart_nginx',
+          description: 'Safely restart nginx server with configuration validation',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              testOnly: {
+                type: 'boolean',
+                description: 'Only test the configuration without restarting (default: false)',
+                default: false,
+              },
+            },
+            required: ['host'],
+          },
+        },
+        {
+          name: 'ssh_list_services',
+          description: 'List systemd services and their status',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              pattern: {
+                type: 'string',
+                description: 'Filter services by name pattern (optional)',
+              },
+              showAll: {
+                type: 'boolean',
+                description: 'Show all services including inactive ones (default: false)',
+                default: false,
+              },
+            },
+            required: ['host'],
+          },
+        },
+        {
+          name: 'ssh_list_timers',
+          description: 'List systemd timers and their status',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              showAll: {
+                type: 'boolean',
+                description: 'Show all timers including inactive ones (default: false)',
+                default: false,
+              },
+            },
+            required: ['host'],
+          },
+        },
       ],
     }));
 
@@ -583,6 +716,47 @@ class SSHMCPServer {
               (args.preservePermissions as boolean) ?? true,
               (args.excludePatterns as string[]) ?? [],
               (args.createDirectories as boolean) ?? true
+            );
+          
+          case 'ssh_read_file':
+            return await this.readFile(
+              args.host as string,
+              args.filePath as string
+            );
+          
+          case 'ssh_diff_file':
+            return await this.diffFile(
+              args.host as string,
+              args.filePath as string,
+              args.content as string,
+              (args.contextLines as number) ?? 3
+            );
+          
+          case 'ssh_diff_files':
+            return await this.diffFiles(
+              args.host as string,
+              args.filePath1 as string,
+              args.filePath2 as string,
+              (args.contextLines as number) ?? 3
+            );
+          
+          case 'ssh_restart_nginx':
+            return await this.restartNginx(
+              args.host as string,
+              (args.testOnly as boolean) ?? false
+            );
+          
+          case 'ssh_list_services':
+            return await this.listServices(
+              args.host as string,
+              args.pattern as string,
+              (args.showAll as boolean) ?? false
+            );
+          
+          case 'ssh_list_timers':
+            return await this.listTimers(
+              args.host as string,
+              (args.showAll as boolean) ?? false
             );
           
           default:
@@ -720,7 +894,7 @@ class SSHMCPServer {
                 stderr: stderr.trim(),
                 success: code === 0,
                 encoding: 'base64',
-            lines: script.split('\n').length,
+                lines: script.split('\n').length,
               }, null, 2),
             },
           ],
@@ -1056,7 +1230,8 @@ class SSHMCPServer {
       command += `[ -f "${filePath}" ] && cp "${filePath}" "${filePath}.bak"; `;
     }
     
-    command += `echo '${encodedContent}' | base64 -d > "${filePath}"`;
+    // Improved command with error checking and verification
+    command += `echo '${encodedContent}' | base64 -d > "${filePath}" && echo "WRITE_SUCCESS" || echo "WRITE_FAILED"`;
 
     return new Promise((resolve, reject) => {
       const child = spawn('ssh', [host, command], {
@@ -1075,6 +1250,13 @@ class SSHMCPServer {
       });
 
       child.on('close', (code) => {
+        // Check for actual write success/failure indicators
+        const writeSuccessful = stdout.includes('WRITE_SUCCESS');
+        const writeFailed = stdout.includes('WRITE_FAILED') || stderr.trim().length > 0;
+        
+        // Determine if the operation actually succeeded
+        const actualSuccess = code === 0 && writeSuccessful && !writeFailed;
+        
         resolve({
           content: [
             {
@@ -1087,11 +1269,17 @@ class SSHMCPServer {
                 contentLength: content.length,
                 contentLines: content.split('\n').length,
                 exitCode: code,
-                success: code === 0,
+                success: actualSuccess,
+                writeSuccessful,
+                writeFailed,
                 stdout: stdout.trim(),
                 stderr: stderr.trim(),
-                message: code === 0 ? 'File rewritten successfully' : 'Rewrite operation failed',
+                message: actualSuccess ? 'File rewritten successfully' : 'Rewrite operation failed',
                 encoding: 'base64',
+                debugInfo: {
+                  commandLength: command.length,
+                  base64Length: encodedContent.length,
+                }
               }, null, 2),
             },
           ],
@@ -1305,6 +1493,403 @@ class SSHMCPServer {
            hasNewlines.test(content) ||
            hasUnicode.test(pattern) || 
            hasUnicode.test(content);
+  }
+
+  private async readFile(host: string, filePath: string): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Use cat to read the file content
+    const command = `cat "${filePath}"`;
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                filePath,
+                exitCode: code,
+                success: code === 0,
+                content: code === 0 ? stdout : null,
+                contentLength: code === 0 ? stdout.length : 0,
+                contentLines: code === 0 ? stdout.split('\n').length : 0,
+                stderr: stderr.trim(),
+                message: code === 0 ? 'File read successfully' : 'Failed to read file',
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH read file failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async diffFile(host: string, filePath: string, content: string, contextLines: number = 3): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Create temporary file with the new content using base64 encoding
+    const encodedContent = Buffer.from(content).toString('base64');
+    const tempFile = `/tmp/diff_content_$$_${Date.now()}`;
+    
+    const command = `echo '${encodedContent}' | base64 -d > "${tempFile}" && diff -u${contextLines > 0 ? contextLines : ''} "${filePath}" "${tempFile}"; DIFF_EXIT=$?; rm -f "${tempFile}"; exit $DIFF_EXIT`;
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        // diff returns 0 if files are identical, 1 if different, 2 if error
+        const filesIdentical = code === 0;
+        const filesDifferent = code === 1;
+        const diffError = code === 2;
+
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                filePath,
+                contextLines,
+                exitCode: code,
+                filesIdentical,
+                filesDifferent,
+                diffError,
+                success: !diffError,
+                diff: stdout.trim(),
+                stderr: stderr.trim(),
+                message: filesIdentical ? 'Files are identical' : 
+                        filesDifferent ? 'Files differ' : 'Error generating diff',
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH diff file failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async diffFiles(host: string, filePath1: string, filePath2: string, contextLines: number = 3): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Use diff to compare the two files
+    const command = `diff -u${contextLines > 0 ? contextLines : ''} "${filePath1}" "${filePath2}"`;
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        // diff returns 0 if files are identical, 1 if different, 2 if error
+        const filesIdentical = code === 0;
+        const filesDifferent = code === 1;
+        const diffError = code === 2;
+
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                filePath1,
+                filePath2,
+                contextLines,
+                exitCode: code,
+                filesIdentical,
+                filesDifferent,
+                diffError,
+                success: !diffError,
+                diff: stdout.trim(),
+                stderr: stderr.trim(),
+                message: filesIdentical ? 'Files are identical' : 
+                        filesDifferent ? 'Files differ' : 'Error comparing files',
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH diff files failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async restartNginx(host: string, testOnly: boolean = false): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Build command that first tests nginx config, then optionally restarts
+    let command = 'nginx -t';
+    if (!testOnly) {
+      // Try reload first, fall back to restart if that fails
+      command += ' && (systemctl reload nginx || systemctl restart nginx) && systemctl status nginx --no-pager -l';
+    }
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        const configValid = stderr.includes('syntax is ok') || stderr.includes('test is successful');
+        const restarted = !testOnly && code === 0;
+        
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                testOnly,
+                exitCode: code,
+                success: code === 0,
+                configValid,
+                restarted,
+                stdout: stdout.trim(),
+                stderr: stderr.trim(),
+                message: testOnly ? 
+                  (configValid ? 'Nginx configuration is valid' : 'Nginx configuration has errors') :
+                  (code === 0 ? 'Nginx restarted successfully' : 'Nginx restart failed'),
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH nginx operation failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async listServices(host: string, pattern?: string, showAll: boolean = false): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Build systemctl command
+    let command = 'systemctl list-units --type=service --no-pager';
+    if (showAll) {
+      command += ' --all';
+    }
+    if (pattern) {
+      command += ` '${pattern}'`;
+    }
+    
+    // Add additional status info
+    command += ' && echo "---DETAILED---" && systemctl status --no-pager -l';
+    if (pattern) {
+      command += ` '${pattern}'`;
+    } else {
+      command += ' --all --type=service';
+    }
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        // Parse the output to extract service information
+        const lines = stdout.split('\n');
+        const services = [];
+        let inServiceList = false;
+        let detailedSection = false;
+        
+        for (const line of lines) {
+          if (line.includes('UNIT') && line.includes('LOAD') && line.includes('ACTIVE')) {
+            inServiceList = true;
+            continue;
+          }
+          if (line.includes('---DETAILED---')) {
+            detailedSection = true;
+            inServiceList = false;
+            continue;
+          }
+          if (inServiceList && line.trim() && !line.includes('loaded units listed')) {
+            const parts = line.trim().split(/\s+/);
+            if (parts.length >= 4) {
+              services.push({
+                unit: parts[0],
+                load: parts[1],
+                active: parts[2],
+                sub: parts[3],
+                description: parts.slice(4).join(' ')
+              });
+            }
+          }
+        }
+
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                pattern,
+                showAll,
+                exitCode: code,
+                success: code === 0,
+                services,
+                serviceCount: services.length,
+                rawOutput: stdout.trim(),
+                stderr: stderr.trim(),
+                message: `Found ${services.length} services`,
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH list services failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async listTimers(host: string, showAll: boolean = false): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Build systemctl command for timers
+    let command = 'systemctl list-timers --no-pager';
+    if (showAll) {
+      command += ' --all';
+    }
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        // Parse the output to extract timer information
+        const lines = stdout.split('\n');
+        const timers = [];
+        let inTimerList = false;
+        
+        for (const line of lines) {
+          if (line.includes('NEXT') && line.includes('LEFT') && line.includes('LAST')) {
+            inTimerList = true;
+            continue;
+          }
+          if (inTimerList && line.trim() && !line.includes('timers listed')) {
+            const parts = line.trim().split(/\s+/);
+            if (parts.length >= 6) {
+              // Parse the timer line - format can vary
+              timers.push({
+                next: parts[0] === 'n/a' ? null : parts[0] + ' ' + (parts[1] || ''),
+                left: parts[0] === 'n/a' ? parts[1] : parts[2],
+                last: parts[0] === 'n/a' ? parts[2] : parts[3],
+                passed: parts[0] === 'n/a' ? parts[3] : parts[4],
+                unit: parts[0] === 'n/a' ? parts[4] : parts[5],
+                activates: parts.slice(parts[0] === 'n/a' ? 5 : 6).join(' ')
+              });
+            }
+          }
+        }
+
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                showAll,
+                exitCode: code,
+                success: code === 0,
+                timers,
+                timerCount: timers.length,
+                rawOutput: stdout.trim(),
+                stderr: stderr.trim(),
+                message: `Found ${timers.length} timers`,
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH list timers failed: ${error.message}`));
+      });
+    });
   }
 
   private loadServerFilter(): ServerFilter {
