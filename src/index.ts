@@ -7,6 +7,8 @@ import {
   ErrorCode,
   ListToolsRequestSchema,
   McpError,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { spawn, exec } from 'child_process';
 import { readFile, access } from 'fs/promises';
@@ -51,6 +53,7 @@ class SSHMCPServer {
       {
         capabilities: {
           tools: {},
+          prompts: {},
         },
       }
     );
@@ -58,6 +61,7 @@ class SSHMCPServer {
     this.serverFilter = this.loadServerFilter();
     this.commandFilter = this.loadCommandFilter();
     this.setupToolHandlers();
+    this.setupPromptHandlers();
     this.setupErrorHandling();
   }
 
@@ -509,8 +513,8 @@ class SSHMCPServer {
           },
         },
         {
-          name: 'ssh_diff_file',
-          description: 'Compare content with a remote file and return the diff',
+          name: 'ssh_diff_content',
+          description: 'Compare user-provided content with a remote file and show differences',
           inputSchema: {
             type: 'object',
             properties: {
@@ -524,7 +528,7 @@ class SSHMCPServer {
               },
               content: {
                 type: 'string',
-                description: 'Content to compare with the remote file',
+                description: 'User content to compare with the remote file',
               },
               contextLines: {
                 type: 'number',
@@ -536,8 +540,8 @@ class SSHMCPServer {
           },
         },
         {
-          name: 'ssh_diff_files',
-          description: 'Compare two files on the remote host and return the diff',
+          name: 'ssh_compare_files',
+          description: 'Compare two files on the remote host and return the differences',
           inputSchema: {
             type: 'object',
             properties: {
@@ -560,6 +564,56 @@ class SSHMCPServer {
               },
             },
             required: ['host', 'filePath1', 'filePath2'],
+          },
+        },
+        {
+          name: 'ssh_file_info',
+          description: 'Get detailed file metadata and statistics without reading the content',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Path to the file on the remote host',
+              },
+            },
+            required: ['host', 'filePath'],
+          },
+        },
+        {
+          name: 'ssh_verify_file',
+          description: 'Verify file integrity, encoding, format, and detect potential issues',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Path to the file on the remote host',
+              },
+              expectedEncoding: {
+                type: 'string',
+                description: 'Expected character encoding (e.g., utf-8, ascii, iso-8859-1)',
+              },
+              expectedLineEnding: {
+                type: 'string',
+                enum: ['unix', 'windows', 'mac'],
+                description: 'Expected line ending format',
+              },
+              maxSampleSize: {
+                type: 'number',
+                description: 'Maximum bytes to sample for analysis (default: 8192)',
+                default: 8192,
+              },
+            },
+            required: ['host', 'filePath'],
           },
         },
         {
@@ -731,6 +785,23 @@ class SSHMCPServer {
             required: ['host', 'service'],
           },
         },
+        {
+          name: 'ssh_get_restrictions',
+          description: 'Get current command and host restrictions/filters. Use this BEFORE attempting commands that might be blocked to understand what is allowed.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              checkCommand: {
+                type: 'string',
+                description: 'Optional: Check if a specific command would be allowed',
+              },
+              checkHost: {
+                type: 'string',
+                description: 'Optional: Check if a specific host is accessible',
+              },
+            },
+          },
+        },
       ],
     }));
 
@@ -832,7 +903,7 @@ class SSHMCPServer {
               args.filePath as string
             );
           
-          case 'ssh_diff_file':
+          case 'ssh_diff_content':
             return await this.diffFile(
               args.host as string,
               args.filePath as string,
@@ -840,12 +911,27 @@ class SSHMCPServer {
               (args.contextLines as number) ?? 3
             );
           
-          case 'ssh_diff_files':
+          case 'ssh_compare_files':
             return await this.diffFiles(
               args.host as string,
               args.filePath1 as string,
               args.filePath2 as string,
               (args.contextLines as number) ?? 3
+            );
+          
+          case 'ssh_file_info':
+            return await this.getFileInfo(
+              args.host as string,
+              args.filePath as string
+            );
+          
+          case 'ssh_verify_file':
+            return await this.verifyFile(
+              args.host as string,
+              args.filePath as string,
+              args.expectedEncoding as string,
+              args.expectedLineEnding as string,
+              (args.maxSampleSize as number) ?? 8192
             );
           
           case 'ssh_restart_nginx':
@@ -894,6 +980,12 @@ class SSHMCPServer {
               (args.pattern as string) ?? 'recent',
               (args.timeRange as string) ?? '5m',
               (args.lines as number) ?? 100
+            );
+          
+          case 'ssh_get_restrictions':
+            return await this.getRestrictions(
+              args.checkCommand as string,
+              args.checkHost as string
             );
           
           default:
@@ -1244,8 +1336,10 @@ class SSHMCPServer {
       case 'replace':
         if (lineNumber && content !== undefined) {
           // Replace specific line number using base64
+          // For line replacement, we still need to use echo because sed needs the content in a variable
+          // This is one case where echo is necessary, but we can use printf for safer handling
           const encodedContent = Buffer.from(content).toString('base64');
-          command += `echo '${encodedContent}' | base64 -d | { read newline; sed -i '${lineNumber}s/.*/'"\$newline"'/' "${filePath}"; }`;
+          command += `printf '%s' '${encodedContent}' | base64 -d | { read newline; sed -i '${lineNumber}s/.*/'"\$newline"'/' "${filePath}"; }`;
         } else if (pattern && content !== undefined) {
           // Replace by pattern using proper escaping and base64 for complex content
           // Escape special sed characters in pattern and replacement
@@ -1256,7 +1350,7 @@ class SSHMCPServer {
           if (this.needsBase64Encoding(pattern, content)) {
             const sedScript = `s/${escapedPattern}/${escapedContent}/g`;
             const encodedScript = Buffer.from(sedScript).toString('base64');
-            command += `echo '${encodedScript}' | base64 -d > /tmp/sed_script_$$ && sed -i -f /tmp/sed_script_$$ "${filePath}"; rm -f /tmp/sed_script_$$`;
+            command += `printf '%s' '${encodedScript}' | base64 -d > /tmp/sed_script_$$ && sed -i -f /tmp/sed_script_$$ "${filePath}"; rm -f /tmp/sed_script_$$`;
           } else {
             // Use direct sed command for simple cases
             command += `sed -i 's/${escapedPattern}/${escapedContent}/g' "${filePath}"`;
@@ -1367,8 +1461,9 @@ class SSHMCPServer {
       command += `[ -f "${filePath}" ] && cp "${filePath}" "${filePath}.bak"; `;
     }
     
-    // Improved command with error checking and verification
-    command += `echo '${encodedContent}' | base64 -d > "${filePath}" && echo "WRITE_SUCCESS" || echo "WRITE_FAILED"`;
+    // Use base64 -d directly - the base64 content will be sent via stdin
+    // This completely avoids shell interpretation of the base64 content
+    command += `base64 -d > "${filePath}" && echo "WRITE_SUCCESS" || echo "WRITE_FAILED"`;
 
     return new Promise((resolve, reject) => {
       const child = spawn('ssh', [host, command], {
@@ -1386,10 +1481,17 @@ class SSHMCPServer {
         stderr += data.toString();
       });
 
+      // Send the base64 content to stdin and close it
+      // This is the key - we write the base64 content directly to stdin
+      if (child.stdin) {
+        child.stdin.write(encodedContent);
+        child.stdin.end();
+      }
+
       child.on('close', (code) => {
         // Check for actual write success/failure indicators
         const writeSuccessful = stdout.includes('WRITE_SUCCESS');
-        const writeFailed = stdout.includes('WRITE_FAILED') || stderr.trim().length > 0;
+        const writeFailed = stdout.includes('WRITE_FAILED');
         
         // Determine if the operation actually succeeded
         const actualSuccess = code === 0 && writeSuccessful && !writeFailed;
@@ -1447,7 +1549,8 @@ class SSHMCPServer {
       command += `touch "${filePath}"; `;
     }
     
-    command += `echo '${encodedContent}' | base64 -d >> "${filePath}"`;
+    // Use base64 -d with stdin to avoid shell interpretation of the base64 content
+    command += `base64 -d >> "${filePath}"`;
 
     return new Promise((resolve, reject) => {
       const child = spawn('ssh', [host, command], {
@@ -1464,6 +1567,13 @@ class SSHMCPServer {
       child.stderr?.on('data', (data) => {
         stderr += data.toString();
       });
+
+      // Send the base64 content to stdin and close it
+      // This avoids shell interpretation of special characters in the base64 string
+      if (child.stdin) {
+        child.stdin.write(encodedContent);
+        child.stdin.end();
+      }
 
       child.on('close', (code) => {
         resolve({
@@ -1595,6 +1705,299 @@ class SSHMCPServer {
             },
           ],
         });
+      });
+    });
+  }
+
+  private async getFileInfo(host: string, filePath: string): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Use stat and ls to get comprehensive file information
+    const command = `stat -c 'TYPE:%F SIZE:%s BLOCKS:%b BLKSIZE:%B INODE:%i LINKS:%h UID:%u GID:%g ATIME:%X MTIME:%Y CTIME:%Z MODE:%a DEVICE:%D' "${filePath}" 2>/dev/null || echo 'STAT_FAILED'; ls -la "${filePath}" 2>/dev/null || echo 'LS_FAILED'; file "${filePath}" 2>/dev/null || echo 'FILE_FAILED'`;
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        const lines = stdout.split('\n');
+        const statLine = lines.find(line => line.startsWith('TYPE:')) || '';
+        const lsLine = lines.find(line => !line.startsWith('TYPE:') && !line.includes('_FAILED') && line.trim() && !line.includes(':')) || '';
+        const fileLine = lines.find(line => line.includes(':') && !line.startsWith('TYPE:')) || '';
+
+        let fileInfo: any = {
+          host,
+          filePath,
+          exitCode: code,
+          success: code === 0 && !stdout.includes('STAT_FAILED'),
+          exists: !stdout.includes('STAT_FAILED'),
+          accessible: !stdout.includes('LS_FAILED'),
+        };
+
+        if (!stdout.includes('STAT_FAILED')) {
+          // Parse stat output
+          const statParts: { [key: string]: string } = {};
+          const statItems = statLine.split(' ');
+          for (const item of statItems) {
+            const [key, value] = item.split(':');
+            if (key && value) {
+              statParts[key] = value;
+            }
+          }
+
+          fileInfo = {
+            ...fileInfo,
+            type: statParts.TYPE || 'unknown',
+            size: parseInt(statParts.SIZE || '0'),
+            blocks: parseInt(statParts.BLOCKS || '0'),
+            blockSize: parseInt(statParts.BLKSIZE || '0'),
+            inode: parseInt(statParts.INODE || '0'),
+            links: parseInt(statParts.LINKS || '0'),
+            uid: parseInt(statParts.UID || '0'),
+            gid: parseInt(statParts.GID || '0'),
+            permissions: {
+              octal: statParts.MODE || '000',
+              readable: (parseInt(statParts.MODE || '0') & 0o444) !== 0,
+              writable: (parseInt(statParts.MODE || '0') & 0o222) !== 0,
+              executable: (parseInt(statParts.MODE || '0') & 0o111) !== 0,
+            },
+            timestamps: {
+              accessed: new Date(parseInt(statParts.ATIME || '0') * 1000).toISOString(),
+              modified: new Date(parseInt(statParts.MTIME || '0') * 1000).toISOString(),
+              changed: new Date(parseInt(statParts.CTIME || '0') * 1000).toISOString(),
+            },
+            device: statParts.DEVICE || 'unknown',
+          };
+        }
+
+        if (!stdout.includes('LS_FAILED') && lsLine) {
+          // Parse ls -la output for additional info
+          const lsParts = lsLine.trim().split(/\s+/);
+          if (lsParts.length >= 9) {
+            fileInfo.permissions = {
+              ...fileInfo.permissions,
+              string: lsParts[0] || 'unknown',
+            };
+            fileInfo.owner = lsParts[2] || 'unknown';
+            fileInfo.group = lsParts[3] || 'unknown';
+          }
+        }
+
+        if (!stdout.includes('FILE_FAILED') && fileLine) {
+          // Parse file command output
+          const fileType = fileLine.split(':').slice(1).join(':').trim();
+          fileInfo.mimeInfo = {
+            description: fileType,
+            isBinary: fileType.includes('binary') || fileType.includes('executable'),
+            isText: fileType.includes('text') || fileType.includes('ASCII'),
+            encoding: fileType.match(/\b(UTF-8|ASCII|ISO-8859|UTF-16)\b/i)?.[0] || 'unknown',
+          };
+        }
+
+        fileInfo.message = fileInfo.success ? 'File information retrieved successfully' : 'Failed to get complete file information';
+
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(fileInfo, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH file info failed: ${error.message}`));
+      });
+    });
+  }
+
+  private async verifyFile(
+    host: string,
+    filePath: string,
+    expectedEncoding?: string,
+    expectedLineEnding?: string,
+    maxSampleSize: number = 8192
+  ): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Build command to analyze file with various tools
+    let command = `
+      echo "=== FILE EXISTS CHECK ===";
+      [ -f "${filePath}" ] && echo "EXISTS:true" || echo "EXISTS:false";
+      
+      echo "=== FILE TYPE ===";
+      file "${filePath}" 2>/dev/null || echo "FILE_FAILED";
+      
+      echo "=== SIZE INFO ===";
+      wc -c "${filePath}" 2>/dev/null || echo "SIZE_FAILED";
+      
+      echo "=== LINE ENDINGS CHECK ===";
+      head -c ${maxSampleSize} "${filePath}" 2>/dev/null | od -c | head -10 2>/dev/null || echo "OD_FAILED";
+      
+      echo "=== ENCODING CHECK ===";
+      head -c ${maxSampleSize} "${filePath}" 2>/dev/null | hexdump -C | head -5 2>/dev/null || echo "HEX_FAILED";
+      
+      echo "=== CHARACTER ANALYSIS ===";
+      head -c ${maxSampleSize} "${filePath}" 2>/dev/null | wc -l 2>/dev/null || echo "LINES_FAILED";
+      head -c ${maxSampleSize} "${filePath}" 2>/dev/null | tr -d '\\0' | wc -c 2>/dev/null || echo "CHARS_FAILED";
+      
+      echo "=== BINARY CHECK ===";
+      head -c ${maxSampleSize} "${filePath}" 2>/dev/null | grep -q '[\\0]' && echo "BINARY:true" || echo "BINARY:false";
+    `;
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        const output = stdout;
+        
+        // Parse the output sections
+        let verification: any = {
+          host,
+          filePath,
+          maxSampleSize,
+          exitCode: code,
+          success: code === 0,
+          exists: output.includes('EXISTS:true'),
+          issues: [] as string[],
+          warnings: [] as string[],
+        };
+
+        // File type analysis
+        const fileTypeMatch = output.match(/=== FILE TYPE ===\s*([^\n=]+)/);
+        if (fileTypeMatch && !fileTypeMatch[1].includes('FILE_FAILED')) {
+          const fileType = fileTypeMatch[1].trim();
+          verification.fileType = {
+            description: fileType,
+            isBinary: fileType.includes('binary') || fileType.includes('executable'),
+            isText: fileType.includes('text') || fileType.includes('ASCII'),
+            encoding: fileType.match(/\b(UTF-8|ASCII|ISO-8859|UTF-16)\b/i)?.[0] || 'unknown',
+          };
+
+          // Check encoding expectations
+          if (expectedEncoding && verification.fileType.encoding !== 'unknown') {
+            if (verification.fileType.encoding.toLowerCase() !== expectedEncoding.toLowerCase()) {
+              verification.issues.push(`Encoding mismatch: expected ${expectedEncoding}, found ${verification.fileType.encoding}`);
+            }
+          }
+        }
+
+        // Size analysis
+        const sizeMatch = output.match(/=== SIZE INFO ===\s*(\d+)/);
+        if (sizeMatch) {
+          verification.size = {
+            bytes: parseInt(sizeMatch[1]),
+            isEmpty: parseInt(sizeMatch[1]) === 0,
+          };
+          if (verification.size.isEmpty) {
+            verification.warnings.push('File is empty');
+          }
+        }
+
+        // Binary analysis
+        verification.binary = {
+          containsNullBytes: output.includes('BINARY:true'),
+        };
+
+        // Line ending analysis
+        const odSection = output.match(/=== LINE ENDINGS CHECK ===[\s\S]*?(?==== |$)/)?.[0];
+        if (odSection && !odSection.includes('OD_FAILED')) {
+          const lineEndings = {
+            unix: (odSection.match(/\\n/g) || []).length,
+            windows: (odSection.match(/\\r\\n/g) || []).length,
+            mac: (odSection.match(/\\r(?!\\n)/g) || []).length,
+          };
+          
+          let detectedLineEnding = 'mixed';
+          if (lineEndings.windows > 0 && lineEndings.unix === 0 && lineEndings.mac === 0) {
+            detectedLineEnding = 'windows';
+          } else if (lineEndings.unix > 0 && lineEndings.windows === 0 && lineEndings.mac === 0) {
+            detectedLineEnding = 'unix';
+          } else if (lineEndings.mac > 0 && lineEndings.windows === 0 && lineEndings.unix === 0) {
+            detectedLineEnding = 'mac';
+          }
+          
+          verification.lineEndings = {
+            detected: detectedLineEnding,
+            counts: lineEndings,
+          };
+
+          // Check line ending expectations
+          if (expectedLineEnding && detectedLineEnding !== 'mixed') {
+            if (detectedLineEnding !== expectedLineEnding) {
+              verification.issues.push(`Line ending mismatch: expected ${expectedLineEnding}, found ${detectedLineEnding}`);
+            }
+          }
+          
+          if (detectedLineEnding === 'mixed') {
+            verification.warnings.push('File contains mixed line endings');
+          }
+        }
+
+        // Character analysis
+        const linesMatch = output.match(/=== CHARACTER ANALYSIS ===\s*(\d+)/);
+        const charsMatch = output.match(/CHARS_FAILED|LINES_FAILED/) ? null : output.match(/(\d+)\s*$/);
+        if (linesMatch) {
+          verification.content = {
+            lines: parseInt(linesMatch[1]),
+            estimatedChars: charsMatch ? parseInt(charsMatch[1]) : 0,
+            sampleSize: maxSampleSize,
+          };
+        }
+
+        // Overall assessment
+        verification.assessment = {
+          isValid: verification.issues.length === 0,
+          hasWarnings: verification.warnings.length > 0,
+          needsAttention: verification.issues.length > 0 || verification.warnings.length > 0,
+        };
+
+        if (!verification.exists) {
+          verification.issues.push('File does not exist');
+        }
+
+        verification.message = verification.assessment.isValid ? 
+          'File verification completed successfully' : 
+          `File verification found ${verification.issues.length} issues and ${verification.warnings.length} warnings`;
+
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(verification, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH verify file failed: ${error.message}`));
       });
     });
   }
@@ -2331,6 +2734,77 @@ class SSHMCPServer {
     }
   }
 
+  private async getRestrictions(checkCommand?: string, checkHost?: string): Promise<any> {
+    const result: any = {
+      commandFilter: {
+        allowList: this.commandFilter.allow,
+        disallowList: this.commandFilter.disallow,
+        mode: this.commandFilter.allow.length > 0 ? 'allowlist' : 'blocklist',
+        description: this.commandFilter.allow.length > 0 
+          ? 'Only commands matching allow patterns are permitted'
+          : 'Commands matching disallow patterns are blocked, all others permitted',
+      },
+      serverFilter: {
+        allowList: this.serverFilter.allow,
+        disallowList: this.serverFilter.disallow,
+        mode: this.serverFilter.allow.length === 0 && this.serverFilter.disallow.length === 0
+          ? 'unrestricted' 
+          : this.serverFilter.allow.length > 0 ? 'allowlist' : 'blocklist',
+      },
+      envVars: {
+        SSH_MCP_COMMAND_ALLOW: process.env.SSH_MCP_COMMAND_ALLOW || '(not set)',
+        SSH_MCP_COMMAND_DISALLOW: process.env.SSH_MCP_COMMAND_DISALLOW || '(using defaults)',
+        SSH_MCP_ALLOW: process.env.SSH_MCP_ALLOW || '(not set)',
+        SSH_MCP_DISALLOW: process.env.SSH_MCP_DISALLOW || '(not set)',
+      },
+    };
+
+    // Check specific command if provided
+    if (checkCommand) {
+      const commandCheck = this.isCommandAllowed(checkCommand);
+      result.commandCheck = {
+        command: checkCommand,
+        allowed: commandCheck.allowed,
+        reason: commandCheck.reason || (commandCheck.allowed ? 'Command is allowed' : 'Command is blocked'),
+      };
+    }
+
+    // Check specific host if provided
+    if (checkHost) {
+      const hostAllowed = this.isHostAllowed(checkHost);
+      const hostExists = this.sshHosts.has(checkHost);
+      result.hostCheck = {
+        host: checkHost,
+        existsInConfig: hostExists,
+        passesFilter: hostAllowed,
+        accessible: hostExists && hostAllowed,
+        reason: !hostExists 
+          ? 'Host not found in SSH config'
+          : !hostAllowed 
+            ? 'Host blocked by server filter'
+            : 'Host is accessible',
+      };
+    }
+
+    // Add helpful suggestions
+    result.suggestions = [];
+    if (checkCommand && !result.commandCheck?.allowed) {
+      result.suggestions.push(
+        `To allow this command, the user can add it to SSH_MCP_COMMAND_ALLOW environment variable in MCP config`,
+        `Ask the user to approve running: "${checkCommand}"`
+      );
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+    };
+  }
+
   private loadServerFilter(): ServerFilter {
     const defaultFilter: ServerFilter = { allow: [], disallow: [] };
     
@@ -2430,7 +2904,7 @@ class SSHMCPServer {
     return regex.test(command.trim());
   }
 
-  private isCommandAllowed(command: string): { allowed: boolean; reason?: string } {
+  private isCommandAllowed(command: string): { allowed: boolean; reason?: string; matchedPattern?: string; suggestions?: string[] } {
     const { allow, disallow } = this.commandFilter;
     
     // Clean the command - remove extra whitespace and get the base command
@@ -2442,7 +2916,17 @@ class SSHMCPServer {
         console.error(`Command '${cleanCommand}' blocked by disallow pattern: '${pattern}'`);
         return { 
           allowed: false, 
-          reason: `Command blocked by security policy. Matches disallowed pattern: '${pattern}'` 
+          matchedPattern: pattern,
+          reason: `⛔ COMMAND BLOCKED: "${cleanCommand}" matches blocked pattern "${pattern}".\n\n` +
+                  `This command is restricted by the SSH MCP server security policy.\n` +
+                  `If the user needs this command executed, they should:\n` +
+                  `1. Run the command manually via their terminal, OR\n` +
+                  `2. Update the SSH MCP configuration to allow this command pattern`,
+          suggestions: [
+            'Ask user to run the command manually',
+            'Suggest an alternative approach',
+            'Use ssh_get_restrictions to see all blocked patterns'
+          ]
         };
       }
     }
@@ -2464,7 +2948,15 @@ class SSHMCPServer {
     console.error(`Command '${cleanCommand}' not allowed - no matching allow patterns`);
     return { 
       allowed: false, 
-      reason: 'Command not in allowed list. Use SSH_MCP_COMMAND_ALLOW to permit specific commands.' 
+      reason: `⛔ COMMAND NOT IN ALLOWLIST: "${cleanCommand}" is not permitted.\n\n` +
+              `The SSH MCP server is configured with an allowlist, and this command doesn't match any allowed patterns.\n` +
+              `If the user needs this command, they should:\n` +
+              `1. Run the command manually via their terminal, OR\n` +
+              `2. Add the command pattern to SSH_MCP_COMMAND_ALLOW in the MCP config`,
+      suggestions: [
+        'Ask user to run the command manually',
+        'Use ssh_get_restrictions to see allowed patterns'
+      ]
     };
   }
 
@@ -2654,6 +3146,87 @@ class SSHMCPServer {
     ];
     
     return applicationPatterns.some(pattern => pattern.test(serviceName));
+  }
+
+  private setupPromptHandlers(): void {
+    const SSH_HELP_TEXT = `I can help you manage remote servers via SSH. Here are the available commands:
+
+**SECURITY & RESTRICTIONS:**
+- "Get SSH restrictions" - Check what commands/hosts are blocked BEFORE attempting them
+- "Check if [command] is allowed" - Verify if a specific command will work
+- Commands may be blocked by security policy - use restrictions check to understand limits
+
+**COMMAND EXECUTION:**
+- "Run [command] on [host]" - Execute a command on remote host
+- "Execute script on [host]" - Run multi-line scripts
+- Supports base64 encoding for complex commands
+
+**FILE OPERATIONS:**
+- "Read file [path] on [host]" - View remote file contents
+- "Edit file [path] on [host]" - Modify files with sed
+- "Rewrite file [path] on [host]" - Replace entire file
+- "Append to file [path]" - Add content to files
+- "Upload [local] to [remote] on [host]" - Transfer files via SCP
+- "Download [remote] to [local] from [host]" - Retrieve files
+- "Bulk transfer [directory]" - Fast tar-based transfers
+
+**SERVICE MANAGEMENT:**
+- "Restart nginx on [host]" - Safe nginx restart with config test
+- "systemctl [action] [service] on [host]" - Control services
+- "List services on [host]" - Show systemd services
+- "List timers on [host]" - Show systemd timers
+
+**LOG VIEWING:**
+- "journalctl [service] on [host]" - View journal logs
+- "Service logs for [service] on [host]" - Quick log access
+- Filter by time, priority, or pattern
+
+**HOST MANAGEMENT:**
+- "List SSH hosts" - Show all configured hosts
+- "Get host info for [host]" - View host details
+
+**FILE COMPARISON:**
+- "Diff [file1] vs [file2] on [host]" - Compare remote files
+- "Compare content with [file] on [host]" - Diff local vs remote
+
+**HANDLING BLOCKED COMMANDS:**
+When a command is blocked, I will:
+1. Explain which security pattern blocked it
+2. Suggest you run the command manually
+3. Offer alternative approaches when possible
+
+Security configuration uses environment variables in MCP config:
+- SSH_MCP_COMMAND_DISALLOW: JSON array of blocked command patterns
+- SSH_MCP_COMMAND_ALLOW: JSON array of allowed commands (allowlist mode)
+- SSH_MCP_ALLOW / SSH_MCP_DISALLOW: Host access filters
+
+All operations use your SSH config from ~/.ssh/config.`;
+
+    this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+      prompts: [
+        {
+          name: 'ssh-help',
+          description: 'Get help with SSH remote commands',
+        },
+      ],
+    }));
+
+    this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+      if (request.params.name === 'ssh-help') {
+        return {
+          messages: [
+            {
+              role: 'user',
+              content: {
+                type: 'text',
+                text: SSH_HELP_TEXT,
+              },
+            },
+          ],
+        };
+      }
+      throw new McpError(ErrorCode.InvalidRequest, `Unknown prompt: ${request.params.name}`);
+    });
   }
 
   private setupErrorHandling(): void {

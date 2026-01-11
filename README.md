@@ -10,6 +10,7 @@ An MCP (Model Context Protocol) server that enables SSH remote command execution
 - **Host Management**: List and inspect all configured SSH hosts
 - **Base64 Encoding**: Eliminates command escaping issues entirely
 - **Security Filtering**: Built-in command filtering prevents dangerous operations
+- **Pre-flight Checks**: Query restrictions before executing to avoid failed attempts
 
 ### Command Execution
 - **Simple Commands**: Execute basic commands with optional base64 encoding
@@ -883,6 +884,73 @@ Quick access to service logs with smart defaults for common patterns:
 - Comprehensive analysis: `ssh_service_logs` with `all` pattern
 - Integration with monitoring systems and dashboards
 
+### 19. ssh_get_restrictions ⚡ NEW!
+Check what commands and hosts are blocked by security filters BEFORE attempting them:
+
+**Get all current restrictions:**
+```json
+{
+}
+```
+
+**Check if a specific command is allowed:**
+```json
+{
+  "checkCommand": "rm -rf /tmp/test"
+}
+```
+
+**Check if a specific host is accessible:**
+```json
+{
+  "checkHost": "production-server"
+}
+```
+
+**Check both command and host:**
+```json
+{
+  "checkCommand": "systemctl restart nginx",
+  "checkHost": "odoo-prod"
+}
+```
+
+**Response includes:**
+- `commandFilter`: Full list of blocked/allowed command patterns
+- `serverFilter`: Full list of blocked/allowed host patterns  
+- `envVars`: Current environment variable configuration
+- `commandCheck`: Result of specific command check (if provided)
+- `hostCheck`: Result of specific host check (if provided)
+- `suggestions`: Helpful suggestions when commands are blocked
+
+**Use cases:**
+- Check restrictions before attempting potentially blocked commands
+- Understand why a command was rejected
+- Verify host access before complex operations
+- Debug security configuration issues
+- Provide clear guidance to users when requests can't be fulfilled
+
+**Example response:**
+```json
+{
+  "commandFilter": {
+    "allowList": [],
+    "disallowList": ["rm *", "rm -rf *", "shutdown.*"],
+    "mode": "blocklist",
+    "description": "Commands matching disallow patterns are blocked, all others permitted"
+  },
+  "commandCheck": {
+    "command": "rm -rf /tmp/test",
+    "allowed": false,
+    "reason": "⛔ COMMAND BLOCKED: matches blocked pattern 'rm -rf *'"
+  },
+  "suggestions": [
+    "Ask user to run the command manually",
+    "Suggest an alternative approach"
+  ]
+}
+```
+
 ## 🎯 Use Cases
 
 ### Odoo Development & Operations
@@ -1155,8 +1223,10 @@ Error: Command timed out after 30 seconds
 Error: Command blocked by security policy. Matches disallowed pattern: 'rm *'
 ```
 - The command matches a security pattern in `SSH_MCP_COMMAND_DISALLOW`
+- **Use `ssh_get_restrictions` to check what's blocked before attempting commands**
 - Add command to `SSH_MCP_COMMAND_ALLOW` if needed
 - Check the Security Configuration section above
+- Ask the user to run the command manually if necessary
 
 **5. Base64 Not Found**
 ```
