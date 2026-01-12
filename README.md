@@ -263,6 +263,71 @@ You can also restrict which SSH hosts can be accessed:
 ["prod-*", "*.internal"]
 ```
 
+### Per-Host Rules (Advanced) ⚡ NEW!
+
+For fine-grained control, create `~/.ssh/ssh_mcp_rules.json` with per-host or per-host-group restrictions:
+
+```json
+{
+  "defaults": {
+    "mode": "permissive"
+  },
+  "hosts": {
+    "production_*": {
+      "mode": "strict",
+      "commandAllow": ["systemctl status *", "journalctl *", "cat *", "tail *"],
+      "commandDisallow": ["rm *", "dd *"],
+      "readonlyPaths": ["/etc", "/opt/odoo"]
+    },
+    "iot_*": {
+      "mode": "allowlist",
+      "commandAllow": ["cat *", "ls *", "systemctl status *", "reboot"]
+    },
+    "dev_*": {
+      "mode": "permissive",
+      "commandDisallow": ["rm -rf /"]
+    }
+  }
+}
+```
+
+**Modes:**
+- `permissive` (default): Block only commands in disallow list
+- `strict`: Must match allow list AND not match disallow list
+- `allowlist`: Only explicitly allowed commands work
+- `readonly`: Block ALL write operations (rm, mv, >, sed -i, etc.)
+
+**Features:**
+- **Pattern matching**: `production_*` matches `production_web`, `production_db`, etc.
+- **Readonly paths**: Block write commands targeting specific directories
+- **Inheritance**: `"inherit": "production_*"` copies rules from another pattern
+- **Env override**: `SSH_MCP_RULES_FILE=/path/to/rules.json`
+
+**Readonly Path Detection:**
+When `readonlyPaths` is set, these write operations are blocked:
+- File deletion: `rm`, `rmdir`, `unlink`
+- File modification: `sed -i`, `>`, `>>`, `tee`
+- File creation: `touch`, `mkdir`, `cp`, `mv`
+
+**Example - Strict Production:**
+```json
+{
+  "hosts": {
+    "nell_production_*": {
+      "mode": "strict",
+      "commandAllow": [
+        "systemctl status *",
+        "systemctl restart odoo*", 
+        "journalctl *",
+        "tail *",
+        "cat *"
+      ],
+      "readonlyPaths": ["/etc", "/opt/odoo", "/var/log"]
+    }
+  }
+}
+```
+
 ## 🔧 Available Tools
 
 ### 1. ssh_execute_command

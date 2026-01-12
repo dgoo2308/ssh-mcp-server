@@ -12,6 +12,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { spawn, exec } from 'child_process';
 import { readFile, access } from 'fs/promises';
+import { readFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { glob } from 'glob';
@@ -38,17 +39,56 @@ interface CommandFilter {
   disallow: string[];
 }
 
+// Per-host restriction rules
+interface HostRule {
+  commandAllow?: string[];
+  commandDisallow?: string[];
+  readonlyPaths?: string[];
+  mode?: 'permissive' | 'strict' | 'allowlist' | 'readonly';
+  inherit?: string;
+}
+
+interface HostRulesConfig {
+  defaults?: HostRule;
+  hosts?: { [pattern: string]: HostRule };
+}
+
+// Write operation patterns for readonly path detection
+const WRITE_COMMAND_PATTERNS = [
+  /^rm\s/i,
+  /^rmdir\s/i,
+  /^mv\s/i,
+  /^cp\s.*\s+\//i,  // cp to a path
+  /^mkdir\s/i,
+  /^touch\s/i,
+  /^chmod\s/i,
+  /^chown\s/i,
+  /^chgrp\s/i,
+  />\s*\//,         // redirect to path
+  />>\s*\//,        // append to path
+  /\btee\s+\//i,    // tee to path
+  /^dd\s/i,
+  /^truncate\s/i,
+  /^shred\s/i,
+  /^install\s/i,
+  /^ln\s/i,
+  /^unlink\s/i,
+  /^sed\s+-i/i,     // sed in-place
+  /^perl\s+-.*i/i,  // perl in-place
+];
+
 class SSHMCPServer {
   private server: Server;
   private sshHosts: Map<string, SSHHost> = new Map();
   private serverFilter: ServerFilter;
   private commandFilter: CommandFilter;
+  private hostRules: HostRulesConfig;
 
   constructor() {
     this.server = new Server(
       {
         name: 'ssh-remote-commands',
-        version: '0.6.0',
+        version: '0.7.0',
       },
       {
         capabilities: {
@@ -60,6 +100,7 @@ class SSHMCPServer {
 
     this.serverFilter = this.loadServerFilter();
     this.commandFilter = this.loadCommandFilter();
+    this.hostRules = this.loadHostRules();
     this.setupToolHandlers();
     this.setupPromptHandlers();
     this.setupErrorHandling();
@@ -1003,10 +1044,29 @@ class SSHMCPServer {
   private async executeCommand(host: string, command: string, timeout: number, useBase64: boolean = false): Promise<any> {
     const hostConfig = this.validateHostAccess(host);
 
-    // Check if command is allowed
-    const commandCheck = this.isCommandAllowed(command);
+    // Check if command is allowed (with per-host rules)
+    const commandCheck = this.isCommandAllowed(command, host);
     if (!commandCheck.allowed) {
-      throw new McpError(ErrorCode.InvalidRequest, commandCheck.reason || 'Command not allowed');
+      // Return error as content instead of throwing - better visibility in Claude
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              host,
+              command,
+              success: false,
+              blocked: true,
+              error: 'COMMAND_BLOCKED',
+              reason: commandCheck.reason,
+              matchedPattern: commandCheck.matchedPattern,
+              hostRule: commandCheck.hostRule,
+              suggestions: commandCheck.suggestions,
+            }, null, 2),
+          },
+        ],
+        isError: true,
+      };
     }
 
     let finalCommand: string;
@@ -1070,16 +1130,36 @@ class SSHMCPServer {
   private async executeScript(host: string, script: string, timeout: number, interpreter: string = 'bash'): Promise<any> {
     const hostConfig = this.validateHostAccess(host);
 
-    // Check if script content is allowed
+    // Check if script content is allowed (with per-host rules)
     // For scripts, we check each line that looks like a command
     const scriptLines = script.split('\n').map(line => line.trim()).filter(line => 
       line && !line.startsWith('#') && !line.startsWith('echo ') // Skip comments and echo statements
     );
     
     for (const line of scriptLines) {
-      const commandCheck = this.isCommandAllowed(line);
+      const commandCheck = this.isCommandAllowed(line, host);
       if (!commandCheck.allowed) {
-        throw new McpError(ErrorCode.InvalidRequest, `Script contains disallowed command: "${line}". ${commandCheck.reason}`);
+        // Return error as content instead of throwing - better visibility in Claude
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                script: script.split('\n').slice(0, 3).join('\n') + (script.split('\n').length > 3 ? '\n...' : ''),
+                success: false,
+                blocked: true,
+                error: 'SCRIPT_BLOCKED',
+                blockedLine: line,
+                reason: commandCheck.reason,
+                matchedPattern: commandCheck.matchedPattern,
+                hostRule: commandCheck.hostRule,
+                suggestions: commandCheck.suggestions,
+              }, null, 2),
+            },
+          ],
+          isError: true,
+        };
       }
     }
 
@@ -2751,28 +2831,27 @@ class SSHMCPServer {
           ? 'unrestricted' 
           : this.serverFilter.allow.length > 0 ? 'allowlist' : 'blocklist',
       },
+      hostRules: {
+        rulesFile: process.env.SSH_MCP_RULES_FILE || join(homedir(), '.ssh', 'ssh_mcp_rules.json'),
+        hasRules: Object.keys(this.hostRules.hosts || {}).length > 0,
+        hostPatterns: Object.keys(this.hostRules.hosts || {}),
+        defaults: this.hostRules.defaults || {},
+      },
       envVars: {
         SSH_MCP_COMMAND_ALLOW: process.env.SSH_MCP_COMMAND_ALLOW || '(not set)',
         SSH_MCP_COMMAND_DISALLOW: process.env.SSH_MCP_COMMAND_DISALLOW || '(using defaults)',
         SSH_MCP_ALLOW: process.env.SSH_MCP_ALLOW || '(not set)',
         SSH_MCP_DISALLOW: process.env.SSH_MCP_DISALLOW || '(not set)',
+        SSH_MCP_RULES_FILE: process.env.SSH_MCP_RULES_FILE || '(using default: ~/.ssh/ssh_mcp_rules.json)',
       },
     };
 
-    // Check specific command if provided
-    if (checkCommand) {
-      const commandCheck = this.isCommandAllowed(checkCommand);
-      result.commandCheck = {
-        command: checkCommand,
-        allowed: commandCheck.allowed,
-        reason: commandCheck.reason || (commandCheck.allowed ? 'Command is allowed' : 'Command is blocked'),
-      };
-    }
-
-    // Check specific host if provided
+    // Check specific host if provided - get per-host rules
     if (checkHost) {
       const hostAllowed = this.isHostAllowed(checkHost);
       const hostExists = this.sshHosts.has(checkHost);
+      const hostRules = this.getHostRules(checkHost);
+      
       result.hostCheck = {
         host: checkHost,
         existsInConfig: hostExists,
@@ -2783,16 +2862,44 @@ class SSHMCPServer {
           : !hostAllowed 
             ? 'Host blocked by server filter'
             : 'Host is accessible',
+        matchedRulePattern: hostRules._matchedPattern || null,
+        effectiveRules: hostRules._matchedPattern ? {
+          mode: hostRules.mode,
+          commandAllow: hostRules.commandAllow || [],
+          commandDisallow: hostRules.commandDisallow || [],
+          readonlyPaths: hostRules.readonlyPaths || [],
+        } : null,
+      };
+    }
+
+    // Check specific command if provided (uses host for per-host rules if provided)
+    if (checkCommand) {
+      const commandCheck = this.isCommandAllowed(checkCommand, checkHost);
+      result.commandCheck = {
+        command: checkCommand,
+        allowed: commandCheck.allowed,
+        reason: commandCheck.reason || (commandCheck.allowed ? 'Command is allowed' : 'Command is blocked'),
+        matchedPattern: commandCheck.matchedPattern,
+        hostRule: commandCheck.hostRule,
       };
     }
 
     // Add helpful suggestions
     result.suggestions = [];
     if (checkCommand && !result.commandCheck?.allowed) {
-      result.suggestions.push(
-        `To allow this command, the user can add it to SSH_MCP_COMMAND_ALLOW environment variable in MCP config`,
-        `Ask the user to approve running: "${checkCommand}"`
-      );
+      if (result.commandCheck?.hostRule) {
+        result.suggestions.push(
+          `Command blocked by per-host rule "${result.commandCheck.hostRule}"`,
+          `Update ~/.ssh/ssh_mcp_rules.json to allow this command for this host`,
+          `Ask the user to run the command manually: "${checkCommand}"`
+        );
+      } else {
+        result.suggestions.push(
+          `To allow this command, update SSH_MCP_COMMAND_ALLOW in MCP config`,
+          `Or add a per-host rule in ~/.ssh/ssh_mcp_rules.json`,
+          `Ask the user to run the command manually: "${checkCommand}"`
+        );
+      }
     }
 
     return {
@@ -2892,6 +2999,109 @@ class SSHMCPServer {
     }
   }
 
+  private loadHostRules(): HostRulesConfig {
+    const defaultConfig: HostRulesConfig = { defaults: {}, hosts: {} };
+    
+    // Try custom path from env, then default path
+    const rulesPath = process.env.SSH_MCP_RULES_FILE || join(homedir(), '.ssh', 'ssh_mcp_rules.json');
+    
+    try {
+      if (!existsSync(rulesPath)) {
+        console.error(`Host rules file not found at ${rulesPath}, using defaults`);
+        return defaultConfig;
+      }
+      
+      const content = readFileSync(rulesPath, 'utf-8');
+      const config = JSON.parse(content) as HostRulesConfig;
+      
+      const hostCount = config.hosts ? Object.keys(config.hosts).length : 0;
+      console.error(`Host rules loaded from ${rulesPath} - ${hostCount} host patterns defined`);
+      
+      return config;
+    } catch (error) {
+      console.error(`Error loading host rules from ${rulesPath}:`, error);
+      return defaultConfig;
+    }
+  }
+
+  private getHostRules(host: string): HostRule & { _matchedPattern?: string } {
+    const { defaults = {}, hosts = {} } = this.hostRules;
+    
+    // Find matching host pattern
+    let matchedRule: HostRule | undefined;
+    let matchedPattern: string | undefined;
+    
+    for (const pattern of Object.keys(hosts)) {
+      if (this.matchesPattern(host, pattern)) {
+        matchedRule = hosts[pattern];
+        matchedPattern = pattern;
+        break;
+      }
+    }
+    
+    if (!matchedRule) {
+      return { ...defaults, _matchedPattern: undefined };
+    }
+    
+    // Handle inheritance
+    let resolvedRule = { ...matchedRule };
+    if (matchedRule.inherit && hosts[matchedRule.inherit]) {
+      const parentRule = hosts[matchedRule.inherit];
+      resolvedRule = {
+        commandAllow: [...(parentRule.commandAllow || []), ...(matchedRule.commandAllow || [])],
+        commandDisallow: [...(parentRule.commandDisallow || []), ...(matchedRule.commandDisallow || [])],
+        readonlyPaths: [...(parentRule.readonlyPaths || []), ...(matchedRule.readonlyPaths || [])],
+        mode: matchedRule.mode || parentRule.mode,
+      };
+    }
+    
+    // Merge with defaults
+    return {
+      commandAllow: [...(defaults.commandAllow || []), ...(resolvedRule.commandAllow || [])],
+      commandDisallow: [...(defaults.commandDisallow || []), ...(resolvedRule.commandDisallow || [])],
+      readonlyPaths: [...(defaults.readonlyPaths || []), ...(resolvedRule.readonlyPaths || [])],
+      mode: resolvedRule.mode || defaults.mode || 'permissive',
+      _matchedPattern: matchedPattern,
+    };
+  }
+
+  private isWriteCommand(command: string): boolean {
+    return WRITE_COMMAND_PATTERNS.some(pattern => pattern.test(command));
+  }
+
+  private extractTargetPaths(command: string): string[] {
+    const paths: string[] = [];
+    
+    // Extract paths that look like they could be targets
+    // Match absolute paths
+    const absolutePathMatch = command.match(/(?:^|\s)(\/[^\s;|&>]+)/g);
+    if (absolutePathMatch) {
+      paths.push(...absolutePathMatch.map(p => p.trim()));
+    }
+    
+    // Match paths in redirects
+    const redirectMatch = command.match(/>{1,2}\s*(\/[^\s;|&]+)/g);
+    if (redirectMatch) {
+      paths.push(...redirectMatch.map(p => p.replace(/>{1,2}\s*/, '')));
+    }
+    
+    return paths;
+  }
+
+  private isPathReadonly(path: string, readonlyPaths: string[]): string | null {
+    for (const roPath of readonlyPaths) {
+      // Normalize paths for comparison
+      const normalizedRoPath = roPath.endsWith('/') ? roPath : roPath + '/';
+      const normalizedPath = path.endsWith('/') ? path : path + '/';
+      
+      // Check if path is under readonly path
+      if (normalizedPath.startsWith(normalizedRoPath) || path === roPath || path.startsWith(roPath + '/')) {
+        return roPath;
+      }
+    }
+    return null;
+  }
+
   private matchesCommandPattern(command: string, pattern: string): boolean {
     // Convert wildcard pattern to regex for command matching
     // More flexible than hostname matching to catch dangerous command variations
@@ -2904,16 +3114,84 @@ class SSHMCPServer {
     return regex.test(command.trim());
   }
 
-  private isCommandAllowed(command: string): { allowed: boolean; reason?: string; matchedPattern?: string; suggestions?: string[] } {
-    const { allow, disallow } = this.commandFilter;
-    
-    // Clean the command - remove extra whitespace and get the base command
+  private isCommandAllowed(command: string, host?: string): { allowed: boolean; reason?: string; matchedPattern?: string; suggestions?: string[]; hostRule?: string } {
     const cleanCommand = command.trim().replace(/\s+/g, ' ');
     
-    // Check disallow list first (takes precedence)
+    // Get per-host rules if host is provided
+    const hostRules = host ? this.getHostRules(host) : null;
+    const mode = hostRules?.mode || 'permissive';
+    
+    // 1. Check readonly mode - block all write commands
+    if (mode === 'readonly' && this.isWriteCommand(cleanCommand)) {
+      return {
+        allowed: false,
+        matchedPattern: 'readonly mode',
+        hostRule: hostRules?._matchedPattern,
+        reason: `⛔ WRITE BLOCKED: Host "${host}" is in readonly mode.\n\n` +
+                `Command "${cleanCommand}" appears to modify files, which is not allowed.\n` +
+                `If write access is needed, ask the user to:\n` +
+                `1. Run the command manually via their terminal, OR\n` +
+                `2. Update the host rules in ~/.ssh/ssh_mcp_rules.json`,
+        suggestions: ['Ask user to run the command manually', 'Change host mode from readonly']
+      };
+    }
+    
+    // 2. Check readonly paths
+    if (hostRules?.readonlyPaths && hostRules.readonlyPaths.length > 0 && this.isWriteCommand(cleanCommand)) {
+      const targetPaths = this.extractTargetPaths(cleanCommand);
+      for (const targetPath of targetPaths) {
+        const matchedReadonly = this.isPathReadonly(targetPath, hostRules.readonlyPaths);
+        if (matchedReadonly) {
+          return {
+            allowed: false,
+            matchedPattern: `readonly path: ${matchedReadonly}`,
+            hostRule: hostRules?._matchedPattern,
+            reason: `⛔ PATH PROTECTED: "${targetPath}" is under readonly path "${matchedReadonly}".\n\n` +
+                    `Write operations to this path are blocked for host "${host}".\n` +
+                    `If write access is needed, ask the user to:\n` +
+                    `1. Run the command manually via their terminal, OR\n` +
+                    `2. Remove the path from readonlyPaths in ~/.ssh/ssh_mcp_rules.json`,
+            suggestions: ['Ask user to run the command manually', 'Update readonlyPaths configuration']
+          };
+        }
+      }
+    }
+    
+    // 3. Check per-host allow list FIRST - explicit allows override disallows
+    if (hostRules?.commandAllow && hostRules.commandAllow.length > 0) {
+      for (const pattern of hostRules.commandAllow) {
+        if (this.matchesCommandPattern(cleanCommand, pattern)) {
+          console.error(`Command '${cleanCommand}' explicitly allowed by host rule pattern: '${pattern}'`);
+          return { allowed: true, hostRule: hostRules?._matchedPattern };
+        }
+      }
+    }
+    
+    // 4. Check per-host disallow list (includes defaults)
+    if (hostRules?.commandDisallow) {
+      for (const pattern of hostRules.commandDisallow) {
+        if (this.matchesCommandPattern(cleanCommand, pattern)) {
+          console.error(`Command '${cleanCommand}' blocked by host rule disallow pattern: '${pattern}'`);
+          return {
+            allowed: false,
+            matchedPattern: pattern,
+            hostRule: hostRules?._matchedPattern,
+            reason: `⛔ COMMAND BLOCKED (host rule): "${cleanCommand}" matches blocked pattern "${pattern}" for host "${host}".\n\n` +
+                    `This command is restricted by per-host security rules.\n` +
+                    `If the user needs this command executed, they should:\n` +
+                    `1. Run the command manually via their terminal, OR\n` +
+                    `2. Add it to commandAllow in ~/.ssh/ssh_mcp_rules.json to override`,
+            suggestions: ['Ask user to run the command manually', 'Add to host commandAllow to override']
+          };
+        }
+      }
+    }
+    
+    // 5. Check global disallow list
+    const { allow, disallow } = this.commandFilter;
     for (const pattern of disallow) {
       if (this.matchesCommandPattern(cleanCommand, pattern)) {
-        console.error(`Command '${cleanCommand}' blocked by disallow pattern: '${pattern}'`);
+        console.error(`Command '${cleanCommand}' blocked by global disallow pattern: '${pattern}'`);
         return { 
           allowed: false, 
           matchedPattern: pattern,
@@ -2931,21 +3209,79 @@ class SSHMCPServer {
       }
     }
     
-    // If allow list is empty, allow by default (only disallow list applies)
+    // 6. For allowlist mode, command must match host allow list
+    if (mode === 'allowlist') {
+      if (hostRules?.commandAllow) {
+        for (const pattern of hostRules.commandAllow) {
+          if (this.matchesCommandPattern(cleanCommand, pattern)) {
+            return { allowed: true };
+          }
+        }
+      }
+      return {
+        allowed: false,
+        hostRule: hostRules?._matchedPattern,
+        reason: `⛔ COMMAND NOT IN HOST ALLOWLIST: "${cleanCommand}" is not permitted for host "${host}".\n\n` +
+                `Host is in allowlist mode - only explicitly allowed commands work.\n` +
+                `Allowed patterns: ${hostRules?.commandAllow?.join(', ') || 'none'}\n` +
+                `If the user needs this command, they should:\n` +
+                `1. Run the command manually via their terminal, OR\n` +
+                `2. Add the command pattern to commandAllow in ~/.ssh/ssh_mcp_rules.json`,
+        suggestions: ['Ask user to run the command manually', 'Add command to host allowlist']
+      };
+    }
+    
+    // 7. For strict mode, check per-host allow list OR global allow list
+    if (mode === 'strict') {
+      // Check per-host allow
+      if (hostRules?.commandAllow) {
+        for (const pattern of hostRules.commandAllow) {
+          if (this.matchesCommandPattern(cleanCommand, pattern)) {
+            return { allowed: true };
+          }
+        }
+      }
+      // Check global allow
+      for (const pattern of allow) {
+        if (this.matchesCommandPattern(cleanCommand, pattern)) {
+          return { allowed: true };
+        }
+      }
+      // If neither matched, deny
+      return {
+        allowed: false,
+        hostRule: hostRules?._matchedPattern,
+        reason: `⛔ COMMAND NOT ALLOWED (strict mode): "${cleanCommand}" is not in any allow list for host "${host}".\n\n` +
+                `Host is in strict mode - commands must be explicitly allowed.\n` +
+                `If the user needs this command, they should:\n` +
+                `1. Run the command manually via their terminal, OR\n` +
+                `2. Add to commandAllow in ~/.ssh/ssh_mcp_rules.json`,
+        suggestions: ['Ask user to run the command manually', 'Add command to allow list']
+      };
+    }
+    
+    // 8. Permissive mode - check global allow list if it exists
     if (allow.length === 0) {
       return { allowed: true };
     }
     
-    // Check allow list
+    // Check per-host allow
+    if (hostRules?.commandAllow) {
+      for (const pattern of hostRules.commandAllow) {
+        if (this.matchesCommandPattern(cleanCommand, pattern)) {
+          return { allowed: true };
+        }
+      }
+    }
+    
+    // Check global allow
     for (const pattern of allow) {
       if (this.matchesCommandPattern(cleanCommand, pattern)) {
-        console.error(`Command '${cleanCommand}' allowed by pattern: '${pattern}'`);
         return { allowed: true };
       }
     }
     
-    // If allow list exists but no patterns match, deny
-    console.error(`Command '${cleanCommand}' not allowed - no matching allow patterns`);
+    // If global allow list exists but no patterns match, deny
     return { 
       allowed: false, 
       reason: `⛔ COMMAND NOT IN ALLOWLIST: "${cleanCommand}" is not permitted.\n\n` +
