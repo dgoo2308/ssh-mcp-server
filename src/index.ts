@@ -3489,8 +3489,15 @@ class SSHMCPServer {
 
 **SECURITY & RESTRICTIONS:**
 - "Get SSH restrictions" - Check what commands/hosts are blocked BEFORE attempting them
-- "Check if [command] is allowed" - Verify if a specific command will work
+- "Check if [command] is allowed on [host]" - Verify if a specific command will work
 - Commands may be blocked by security policy - use restrictions check to understand limits
+
+**PER-HOST RULES (~/.ssh/ssh_mcp_rules.json):**
+- Configure different restrictions per host or host group (e.g., "production_*", "iot_*")
+- Modes: permissive (default), strict, allowlist, readonly
+- Explicit allows override default blocks
+- Readonly paths protect specific directories from write operations
+- Example: production servers can be strict, dev servers permissive
 
 **COMMAND EXECUTION:**
 - "Run [command] on [host]" - Execute a command on remote host
@@ -3526,15 +3533,14 @@ class SSHMCPServer {
 - "Compare content with [file] on [host]" - Diff local vs remote
 
 **HANDLING BLOCKED COMMANDS:**
-When a command is blocked, I will:
-1. Explain which security pattern blocked it
-2. Suggest you run the command manually
-3. Offer alternative approaches when possible
+When a command is blocked, I will return details including:
+- Which pattern blocked it and for which host rule
+- Suggestions (run manually, add to allowlist, etc.)
 
-Security configuration uses environment variables in MCP config:
-- SSH_MCP_COMMAND_DISALLOW: JSON array of blocked command patterns
-- SSH_MCP_COMMAND_ALLOW: JSON array of allowed commands (allowlist mode)
-- SSH_MCP_ALLOW / SSH_MCP_DISALLOW: Host access filters
+**CONFIGURATION:**
+- Global: SSH_MCP_COMMAND_DISALLOW / SSH_MCP_COMMAND_ALLOW env vars
+- Per-host: ~/.ssh/ssh_mcp_rules.json (or SSH_MCP_RULES_FILE env var)
+- Host filters: SSH_MCP_ALLOW / SSH_MCP_DISALLOW
 
 All operations use your SSH config from ~/.ssh/config.`;
 
