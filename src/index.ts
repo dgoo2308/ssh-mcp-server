@@ -88,7 +88,7 @@ class SSHMCPServer {
     this.server = new Server(
       {
         name: 'ssh-remote-commands',
-        version: '0.7.0',
+        version: '0.8.0',
       },
       {
         capabilities: {
