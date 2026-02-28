@@ -88,7 +88,7 @@ class SSHMCPServer {
     this.server = new Server(
       {
         name: 'ssh-remote-commands',
-        version: '0.8.0',
+        version: '0.9.0',
       },
       {
         capabilities: {
@@ -827,6 +827,62 @@ class SSHMCPServer {
           },
         },
         {
+          name: 'ssh_replace_in_file',
+          description: 'Replace content in a remote file via SSH using one of 4 modes: line range (start_line+end_line), pattern anchored (start_pattern+end_pattern), marker based (marker), or exact match (old_string). Picks mode based on which parameters are provided.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Path to the file on the remote host',
+              },
+              new_content: {
+                type: 'string',
+                description: 'Replacement content',
+              },
+              start_line: {
+                type: 'number',
+                description: 'Mode 1 (line range): Starting line number (1-based, inclusive)',
+              },
+              end_line: {
+                type: 'number',
+                description: 'Mode 1 (line range): Ending line number (1-based, inclusive)',
+              },
+              start_pattern: {
+                type: 'string',
+                description: 'Mode 2 (pattern anchored): Regex matching the start boundary line',
+              },
+              end_pattern: {
+                type: 'string',
+                description: 'Mode 2 (pattern anchored): Regex matching the end boundary line',
+              },
+              inclusive: {
+                type: 'boolean',
+                description: 'Mode 2 (pattern anchored): Whether to replace the matched boundary lines too (default: true)',
+                default: true,
+              },
+              marker: {
+                type: 'string',
+                description: 'Mode 3 (marker based): Marker name — replaces content between "# BEGIN: <marker>" and "# END: <marker>" comment lines (exclusive)',
+              },
+              old_string: {
+                type: 'string',
+                description: 'Mode 4 (exact match): Exact string to find and replace',
+              },
+              backup: {
+                type: 'boolean',
+                description: 'Create backup file before editing (default: true)',
+                default: true,
+              },
+            },
+            required: ['host', 'filePath', 'new_content'],
+          },
+        },
+        {
           name: 'ssh_get_restrictions',
           description: 'Get current command and host restrictions/filters. Use this BEFORE attempting commands that might be blocked to understand what is allowed.',
           inputSchema: {
@@ -1023,6 +1079,21 @@ class SSHMCPServer {
               (args.lines as number) ?? 100
             );
           
+          case 'ssh_replace_in_file':
+            return await this.replaceInFile(
+              args.host as string,
+              args.filePath as string,
+              args.new_content as string,
+              args.start_line as number | undefined,
+              args.end_line as number | undefined,
+              args.start_pattern as string | undefined,
+              args.end_pattern as string | undefined,
+              (args.inclusive as boolean) ?? true,
+              args.marker as string | undefined,
+              args.old_string as string | undefined,
+              (args.backup as boolean) ?? true
+            );
+
           case 'ssh_get_restrictions':
             return await this.getRestrictions(
               args.checkCommand as string,
@@ -2812,6 +2883,259 @@ class SSHMCPServer {
     } catch (error) {
       throw new McpError(ErrorCode.InternalError, `Service logs failed: ${error}`);
     }
+  }
+
+  private async replaceInFile(
+    host: string,
+    filePath: string,
+    newContent: string,
+    startLine?: number,
+    endLine?: number,
+    startPattern?: string,
+    endPattern?: string,
+    inclusive: boolean = true,
+    marker?: string,
+    oldString?: string,
+    backup: boolean = true
+  ): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    // Determine mode based on provided parameters
+    let mode: string;
+    if (startLine !== undefined && endLine !== undefined) {
+      mode = 'line_range';
+    } else if (startPattern !== undefined && endPattern !== undefined) {
+      mode = 'pattern_anchored';
+    } else if (marker !== undefined) {
+      mode = 'marker_based';
+    } else if (oldString !== undefined) {
+      mode = 'exact_match';
+    } else {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        'Must provide one of: start_line+end_line, start_pattern+end_pattern, marker, or old_string'
+      );
+    }
+
+    // Encode new content as base64 to safely transfer arbitrary text
+    const encodedContent = Buffer.from(newContent).toString('base64');
+
+    // Build backup command prefix
+    const backupCmd = backup ? `[ -f "${filePath}" ] && cp "${filePath}" "${filePath}.bak"; ` : '';
+
+    let script: string;
+
+    if (mode === 'line_range') {
+      // Mode 1: Replace lines start_line..end_line (1-based, inclusive) with new_content
+      // Strategy: use awk to output lines before start_line, then new_content, then lines after end_line
+      script = `
+set -e
+${backupCmd}
+TMPFILE=$(mktemp)
+NEW_CONTENT=$(printf '%s' '${encodedContent}' | base64 -d)
+awk -v start=${startLine} -v end=${endLine} -v newcontent="$NEW_CONTENT" '
+BEGIN { printed = 0 }
+NR < start { print }
+NR == start { printf "%s\\n", newcontent; printed = 1 }
+NR > start && NR <= end { next }
+NR > end { print }
+' "${filePath}" > "$TMPFILE"
+mv "$TMPFILE" "${filePath}"
+echo "REPLACE_SUCCESS:lines_${startLine}_to_${endLine}"
+`;
+    } else if (mode === 'pattern_anchored') {
+      // Mode 2: Replace content between first line matching start_pattern and first subsequent line matching end_pattern
+      // inclusive=true means the matched lines themselves are replaced; false means preserve them
+      const inclusiveFlag = inclusive ? 1 : 0;
+      script = `
+set -e
+${backupCmd}
+TMPFILE=$(mktemp)
+NEW_CONTENT=$(printf '%s' '${encodedContent}' | base64 -d)
+awk -v start_pat='${startPattern!.replace(/'/g, "'\\''")}' -v end_pat='${endPattern!.replace(/'/g, "'\\''")}' -v incl=${inclusiveFlag} -v newcontent="$NEW_CONTENT" '
+BEGIN { phase = 0; replaced = 0 }
+phase == 0 {
+  if ($0 ~ start_pat) {
+    phase = 1
+    replaced = 1
+    if (!incl) { print }
+    printf "%s\\n", newcontent
+  } else {
+    print
+  }
+  next
+}
+phase == 1 {
+  if ($0 ~ end_pat) {
+    phase = 2
+    if (!incl) { print }
+  }
+  next
+}
+phase == 2 { print }
+END { if (phase < 2 && replaced) { print "AWK_PATTERN_NOT_CLOSED" > "/dev/stderr" } }
+' "${filePath}" > "$TMPFILE"
+if grep -q "AWK_PATTERN_NOT_CLOSED" /dev/stderr 2>/dev/null; then
+  rm -f "$TMPFILE"
+  echo "REPLACE_FAILED:end_pattern_not_found"
+  exit 1
+fi
+mv "$TMPFILE" "${filePath}"
+echo "REPLACE_SUCCESS:pattern_anchored"
+`;
+    } else if (mode === 'marker_based') {
+      // Mode 3: Replace content between "# BEGIN: <marker>" and "# END: <marker>" (exclusive of marker lines)
+      const safeMarker = marker!.replace(/'/g, "'\\''");
+      script = `
+set -e
+${backupCmd}
+TMPFILE=$(mktemp)
+NEW_CONTENT=$(printf '%s' '${encodedContent}' | base64 -d)
+BEGIN_MARKER="# BEGIN: ${safeMarker}"
+END_MARKER="# END: ${safeMarker}"
+awk -v begin_marker="$BEGIN_MARKER" -v end_marker="$END_MARKER" -v newcontent="$NEW_CONTENT" '
+BEGIN { phase = 0; found_begin = 0; found_end = 0 }
+$0 == begin_marker {
+  phase = 1
+  found_begin = 1
+  print
+  printf "%s\\n", newcontent
+  next
+}
+phase == 1 {
+  if ($0 == end_marker) {
+    phase = 2
+    found_end = 1
+    print
+  }
+  next
+}
+{ print }
+END {
+  if (!found_begin) { print "MARKER_BEGIN_NOT_FOUND" > "/dev/stderr" }
+  else if (!found_end) { print "MARKER_END_NOT_FOUND" > "/dev/stderr" }
+}
+' "${filePath}" > "$TMPFILE"
+STDERR_CHECK=$(awk -v begin_marker="$BEGIN_MARKER" -v end_marker="$END_MARKER" '
+  $0 == begin_marker { found_begin = 1 }
+  $0 == end_marker { found_end = 1 }
+  END {
+    if (!found_begin) print "MARKER_BEGIN_NOT_FOUND"
+    else if (!found_end) print "MARKER_END_NOT_FOUND"
+  }
+' "${filePath}.bak" 2>/dev/null || awk -v begin_marker="$BEGIN_MARKER" -v end_marker="$END_MARKER" '
+  $0 == begin_marker { found_begin = 1 }
+  $0 == end_marker { found_end = 1 }
+  END {
+    if (!found_begin) print "MARKER_BEGIN_NOT_FOUND"
+    else if (!found_end) print "MARKER_END_NOT_FOUND"
+  }
+' "${filePath}")
+if [ -n "$STDERR_CHECK" ]; then
+  rm -f "$TMPFILE"
+  echo "REPLACE_FAILED:$STDERR_CHECK"
+  exit 1
+fi
+mv "$TMPFILE" "${filePath}"
+echo "REPLACE_SUCCESS:marker_based:${safeMarker}"
+`;
+    } else {
+      // Mode 4: Exact string match — find old_string and replace with new_content
+      // We use a Python script via base64 to handle arbitrary strings reliably
+      const encodedOldString = Buffer.from(oldString!).toString('base64');
+      script = `
+set -e
+${backupCmd}
+OLD_CONTENT=$(printf '%s' '${encodedOldString}' | base64 -d)
+NEW_CONTENT=$(printf '%s' '${encodedContent}' | base64 -d)
+python3 - <<'PYEOF'
+import sys, base64, os
+
+old_bytes = base64.b64decode('${encodedOldString}')
+new_bytes = base64.b64decode('${encodedContent}')
+filepath = '${filePath.replace(/'/g, "'\\''")}'
+
+with open(filepath, 'rb') as f:
+    content = f.read()
+
+if old_bytes not in content:
+    print('REPLACE_FAILED:old_string_not_found')
+    sys.exit(1)
+
+new_content = content.replace(old_bytes, new_bytes, 1)
+tmppath = filepath + '.tmp_replace'
+with open(tmppath, 'wb') as f:
+    f.write(new_content)
+os.replace(tmppath, filepath)
+print('REPLACE_SUCCESS:exact_match')
+PYEOF
+`;
+    }
+
+    return new Promise((resolve, reject) => {
+      const encodedScript = Buffer.from(script).toString('base64');
+      const command = `echo '${encodedScript}' | base64 -d | bash`;
+
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        const outputTrimmed = stdout.trim();
+        const success = code === 0 && outputTrimmed.includes('REPLACE_SUCCESS');
+        const failed = outputTrimmed.includes('REPLACE_FAILED');
+
+        // Parse success info
+        let linesAffected: string | null = null;
+        const successMatch = outputTrimmed.match(/REPLACE_SUCCESS:([^\n]*)/);
+        if (successMatch) {
+          linesAffected = successMatch[1];
+        }
+
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                filePath,
+                mode,
+                backup,
+                exitCode: code,
+                success: success && !failed,
+                modeDetail: linesAffected,
+                newContentLength: newContent.length,
+                newContentLines: newContent.split('\n').length,
+                stdout: outputTrimmed,
+                stderr: stderr.trim(),
+                message: success && !failed
+                  ? `File updated successfully using ${mode} mode`
+                  : `Replace operation failed (mode: ${mode})`,
+                ...(mode === 'line_range' ? { startLine, endLine } : {}),
+                ...(mode === 'pattern_anchored' ? { startPattern, endPattern, inclusive } : {}),
+                ...(mode === 'marker_based' ? { marker } : {}),
+                ...(mode === 'exact_match' ? { oldStringLength: oldString!.length } : {}),
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH replace in file failed: ${error.message}`));
+      });
+    });
   }
 
   private async getRestrictions(checkCommand?: string, checkHost?: string): Promise<any> {
