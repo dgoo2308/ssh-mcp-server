@@ -42,7 +42,7 @@ curl -sSL https://raw.githubusercontent.com/dgoo2308/ssh-mcp-server/main/install
 Or clone manually:
 
 ```bash
-git clone git@github.com:dgoo2308/ssh-mcp-server.git ~/git/ssh_mcp
+git clone https://github.com/dgoo2308/ssh-mcp-server.git ~/git/ssh_mcp
 cd ~/git/ssh_mcp
 npm install
 npm run build

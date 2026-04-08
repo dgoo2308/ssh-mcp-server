@@ -46,7 +46,7 @@ if [ -d "$INSTALL_DIR" ]; then
 fi
 
 echo "📦 Cloning repository..."
-git clone git@github.com:dgoo2308/ssh-mcp-server.git "$INSTALL_DIR"
+git clone https://github.com/dgoo2308/ssh-mcp-server.git "$INSTALL_DIR"
 
 # Change to installation directory
 cd "$INSTALL_DIR"
