@@ -36,13 +36,13 @@ An MCP (Model Context Protocol) server that enables SSH remote command execution
 Run the install script to automatically clone, build, and configure:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/v-odoo-testing/ssh-mcp-server/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/dgoo2308/ssh-mcp-server/main/install.sh | bash
 ```
 
 Or clone manually:
 
 ```bash
-git clone git@github.com:v-odoo-testing/ssh-mcp-server.git ~/git/ssh_mcp
+git clone git@github.com:dgoo2308/ssh-mcp-server.git ~/git/ssh_mcp
 cd ~/git/ssh_mcp
 npm install
 npm run build
