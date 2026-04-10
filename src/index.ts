@@ -146,12 +146,17 @@ class SSHMCPServer {
       const value = valueParts.join(' ');
 
       if (key.toLowerCase() === 'host') {
-        // Save previous host if exists
-        if (currentHost && this.isHostAllowed(currentHost.host)) {
-          this.sshHosts.set(currentHost.host, currentHost);
+        // Save previous host - each alias gets its own map entry
+        if (currentHost) {
+          const aliases = currentHost.host.split(/\s+/).filter(Boolean);
+          for (const alias of aliases) {
+            if (this.isHostAllowed(alias)) {
+              this.sshHosts.set(alias, { ...currentHost, host: alias });
+            }
+          }
         }
-        
-        // Start new host
+
+        // Start new host (store raw value; aliases split when saving)
         currentHost = { host: value };
       } else if (currentHost && key && value) {
         // Add property to current host
@@ -178,9 +183,14 @@ class SSHMCPServer {
       }
     }
 
-    // Save last host
-    if (currentHost && this.isHostAllowed(currentHost.host)) {
-      this.sshHosts.set(currentHost.host, currentHost);
+    // Save last host - each alias gets its own map entry
+    if (currentHost) {
+      const aliases = currentHost.host.split(/\s+/).filter(Boolean);
+      for (const alias of aliases) {
+        if (this.isHostAllowed(alias)) {
+          this.sshHosts.set(alias, { ...currentHost, host: alias });
+        }
+      }
     }
   }
 
