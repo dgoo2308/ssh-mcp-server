@@ -668,6 +668,49 @@ class SSHMCPServer {
           },
         },
         {
+          name: 'ssh_tree',
+          description: 'List a remote directory as a token-efficient tree. Single SSH call using GNU find (-printf). By default prunes node_modules, .git, __pycache__, and dotfiles, and caps depth and entry count.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'SSH host alias from your SSH config',
+              },
+              path: {
+                type: 'string',
+                description: 'Remote directory path to list',
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum directory depth to descend (default: 3)',
+                default: 3,
+              },
+              excludePatterns: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Directory/file name patterns to prune. Defaults to [node_modules, .git, __pycache__]. Pass [] to disable.',
+              },
+              showHidden: {
+                type: 'boolean',
+                description: 'Include dotfiles and dot-directories (default: false)',
+                default: false,
+              },
+              showSize: {
+                type: 'boolean',
+                description: 'Show file sizes in tree output (default: true)',
+                default: true,
+              },
+              maxEntries: {
+                type: 'number',
+                description: 'Cap on total entries returned (default: 500)',
+                default: 500,
+              },
+            },
+            required: ['host', 'path'],
+          },
+        },
+        {
           name: 'ssh_restart_nginx',
           description: 'Safely restart nginx server with configuration validation',
           inputSchema: {
@@ -1102,6 +1145,17 @@ class SSHMCPServer {
               args.marker as string | undefined,
               args.old_string as string | undefined,
               (args.backup as boolean) ?? true
+            );
+
+          case 'ssh_tree':
+            return await this.treeDirectory(
+              args.host as string,
+              args.path as string,
+              (args.maxDepth as number) ?? 3,
+              args.excludePatterns as string[] | undefined,
+              (args.showHidden as boolean) ?? false,
+              (args.showSize as boolean) ?? true,
+              (args.maxEntries as number) ?? 500
             );
 
           case 'ssh_get_restrictions':
@@ -2243,6 +2297,149 @@ class SSHMCPServer {
         reject(new McpError(ErrorCode.InternalError, `SSH read file failed: ${error.message}`));
       });
     });
+  }
+
+  private async treeDirectory(
+    host: string,
+    path: string,
+    maxDepth: number,
+    excludePatterns: string[] | undefined,
+    showHidden: boolean,
+    showSize: boolean,
+    maxEntries: number
+  ): Promise<any> {
+    const hostConfig = this.validateHostAccess(host);
+
+    const defaultExcludes = ['node_modules', '.git', '__pycache__'];
+    const excludes = excludePatterns !== undefined ? excludePatterns : defaultExcludes;
+
+    const shellEscape = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+    const escapedPath = shellEscape(path);
+
+    const pruneNames = excludes.map(p => `-name ${shellEscape(p)}`);
+    if (!showHidden) {
+      pruneNames.push(`-name '.*'`);
+    }
+    const pruneClause = pruneNames.length > 0
+      ? `\\( ${pruneNames.join(' -o ')} \\) -prune -o `
+      : '';
+
+    const depth = Math.max(1, Math.floor(maxDepth));
+    const cap = Math.max(1, Math.floor(maxEntries));
+    const command = `find ${escapedPath} -mindepth 1 -maxdepth ${depth} ${pruneClause}-printf '%y\\t%p\\t%s\\t%l\\n' | head -n ${cap + 1}`;
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('ssh', [host, command], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (data) => { stdout += data.toString(); });
+      child.stderr?.on('data', (data) => { stderr += data.toString(); });
+
+      child.on('close', (code) => {
+        const lines = stdout.split('\n').filter(l => l.length > 0);
+        const entries: { type: string; path: string; size: number; link?: string }[] = [];
+
+        for (const line of lines) {
+          const parts = line.split('\t');
+          if (parts.length >= 3 && /^[fdlcbps]$/.test(parts[0])) {
+            const entry: { type: string; path: string; size: number; link?: string } = {
+              type: parts[0],
+              path: parts[1],
+              size: parseInt(parts[2], 10) || 0,
+            };
+            if (parts[0] === 'l' && parts[3]) {
+              entry.link = parts[3];
+            }
+            entries.push(entry);
+          }
+        }
+
+        const truncated = entries.length > cap;
+        const shown = truncated ? entries.slice(0, cap) : entries;
+        const tree = this.renderTree(shown, path, showSize);
+
+        const fileCount = shown.filter(e => e.type === 'f').length;
+        const dirCount = shown.filter(e => e.type === 'd').length;
+        const linkCount = shown.filter(e => e.type === 'l').length;
+
+        const stderrTrim = stderr.trim();
+        const warnings = stderrTrim
+          ? stderrTrim.split('\n').slice(0, 10)
+          : undefined;
+
+        // Success: got entries, OR truly-empty dir with no stderr.
+        // Failure: zero entries AND stderr present (no such path / permission denied at root).
+        const success = entries.length > 0 || !stderrTrim;
+
+        resolve({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                host,
+                path,
+                maxDepth: depth,
+                excludePatterns: excludes,
+                showHidden,
+                exitCode: code,
+                success,
+                entryCount: shown.length,
+                fileCount,
+                dirCount,
+                ...(linkCount > 0 ? { linkCount } : {}),
+                truncated,
+                ...(truncated ? { hint: `Output truncated at ${cap} entries. Increase maxEntries or narrow the path.` } : {}),
+                ...(warnings ? { warnings } : {}),
+                tree,
+              }, null, 2),
+            },
+          ],
+        });
+      });
+
+      child.on('error', (error) => {
+        reject(new McpError(ErrorCode.InternalError, `SSH tree failed: ${error.message}`));
+      });
+    });
+  }
+
+  private renderTree(
+    entries: { type: string; path: string; size: number; link?: string }[],
+    rootPath: string,
+    showSize: boolean
+  ): string {
+    const rootNorm = rootPath.replace(/\/+$/, '') || '/';
+    if (entries.length === 0) return `${rootNorm}/  (empty)`;
+
+    const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
+    const rootSegs = rootNorm === '/' ? 0 : rootNorm.split('/').filter(Boolean).length;
+    const lines: string[] = [`${rootNorm}/`];
+
+    for (const e of sorted) {
+      const segs = e.path.split('/').filter(Boolean);
+      const depth = segs.length - rootSegs;
+      if (depth < 1) continue;
+      const name = segs[segs.length - 1];
+      const indent = '  '.repeat(depth - 1);
+      const suffix =
+        e.type === 'd' ? '/' :
+        e.type === 'l' ? ` -> ${e.link ?? '?'}` :
+        showSize && e.type === 'f' ? `  ${this.formatSize(e.size)}` : '';
+      lines.push(`${indent}${name}${suffix}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  private formatSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes}B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}K`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}M`;
+    return `${(bytes / 1024 / 1024 / 1024).toFixed(1)}G`;
   }
 
   private async diffFile(host: string, filePath: string, content: string, contextLines: number = 3): Promise<any> {

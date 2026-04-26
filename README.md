@@ -1016,6 +1016,71 @@ Check what commands and hosts are blocked by security filters BEFORE attempting 
 }
 ```
 
+### 20. ssh_tree ⚡ NEW!
+List a remote directory as a token-efficient tree using a single SSH call. Designed to give the LLM a fast, scannable view of a remote filesystem without paying for verbose `ls -laR` or `find` output.
+
+**Basic usage:**
+```json
+{
+  "host": "odoo-prod",
+  "path": "/opt/odoo"
+}
+```
+
+**With all options:**
+```json
+{
+  "host": "odoo-prod",
+  "path": "/opt/odoo",
+  "maxDepth": 4,
+  "excludePatterns": ["node_modules", ".git", "__pycache__", ".venv"],
+  "showHidden": true,
+  "showSize": true,
+  "maxEntries": 1000
+}
+```
+
+**Defaults:**
+- `maxDepth`: 3
+- `excludePatterns`: `["node_modules", ".git", "__pycache__"]` (pass `[]` to disable)
+- `showHidden`: false (dotfiles and dot-directories are pruned)
+- `showSize`: true (shows file sizes like `4.4K`, `1.0M`)
+- `maxEntries`: 500 (output is truncated and flagged when exceeded)
+
+**Output:**
+- `tree`: a compact indent-based tree string. Directories end with `/`, symlinks render as `name -> target`, files show their size when `showSize` is true.
+- `entryCount`, `fileCount`, `dirCount`, `linkCount`: structural summary
+- `truncated` + `hint`: set when the result hit `maxEntries`
+- `warnings`: surfaces `find` errors like permission-denied on a subdirectory
+
+**Example tree output:**
+```
+/opt/sh/
+backups/
+  deployment_manager_20260420_144014.tar.gz  274.8K
+config/
+  gunicorn_config.py  660B
+deployment_manager/
+  app.py  90.6K
+  templates/
+    base.html  13.1K
+venv/
+  bin/
+    python -> python3.9
+    python3.9 -> /usr/bin/python3.9
+  lib64 -> lib
+```
+
+**Requirements:**
+- Remote host needs **GNU `find`** (the `-printf` format is GNU-specific). This is true on every mainstream Linux distro (Debian/Ubuntu, RHEL/Rocky/CentOS, Fedora, Arch, SUSE). It is *not* true on stock macOS or BSD targets.
+
+**Perfect for:**
+- Getting your bearings on an unfamiliar remote system
+- Quickly inspecting a deployment directory layout
+- Finding stray files (`.DS_Store`, backups, old configs)
+- Reviewing a project structure before editing files
+- Scanning multiple deployment environments side-by-side
+
 ## 🎯 Use Cases
 
 ### Odoo Development & Operations
