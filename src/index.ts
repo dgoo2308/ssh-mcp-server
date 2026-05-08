@@ -88,7 +88,7 @@ class SSHMCPServer {
     this.server = new Server(
       {
         name: 'ssh-remote-commands',
-        version: '0.9.0',
+        version: '0.10.1',
       },
       {
         capabilities: {
@@ -1541,10 +1541,14 @@ class SSHMCPServer {
 
     // Use base64 encoding for all content to avoid escaping issues
     let command = '';
-    
-    // Create backup if requested
+
+    // Capture original mode so we can restore after sed -i (BusyBox sed has historic
+    // edge cases where -i does not preserve mode). Restored at the end of the command.
+    command += `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); `;
+
+    // Create backup if requested (cp -p so .bak matches original mode + timestamps)
     if (backup) {
-      command += `[ -f "${filePath}" ] && cp "${filePath}" "${filePath}.bak"; `;
+      command += `[ -f "${filePath}" ] && cp -p "${filePath}" "${filePath}.bak"; `;
     }
 
     switch (operation) {
@@ -1607,6 +1611,10 @@ class SSHMCPServer {
       default:
         throw new McpError(ErrorCode.InvalidRequest, `Unknown operation: ${operation}`);
     }
+
+    // Capture the edit's exit code, restore mode on success, then propagate the code
+    // (no-op if the file did not exist before, since _ORIG_MODE will be empty).
+    command += `; _RC=$?; [ "$_RC" -eq 0 ] && [ -n "$_ORIG_MODE" ] && chmod "$_ORIG_MODE" "${filePath}"; exit $_RC`;
 
     return new Promise((resolve, reject) => {
       const child = spawn('ssh', [host, command], {
@@ -1671,14 +1679,21 @@ class SSHMCPServer {
     if (createDirectories) {
       command += `mkdir -p "$(dirname "${filePath}")"; `;
     }
-    
+
+    // Capture original mode before any backup/write so we can restore it after.
+    // `>` truncates and preserves inode/mode of an existing file, so this is largely
+    // defensive — but it makes the contract explicit and survives remote shells
+    // that may re-create the file under noclobber fallbacks.
+    command += `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); `;
+
     if (backup) {
-      command += `[ -f "${filePath}" ] && cp "${filePath}" "${filePath}.bak"; `;
+      command += `[ -f "${filePath}" ] && cp -p "${filePath}" "${filePath}.bak"; `;
     }
-    
-    // Use base64 -d directly - the base64 content will be sent via stdin
-    // This completely avoids shell interpretation of the base64 content
-    command += `base64 -d > "${filePath}" && echo "WRITE_SUCCESS" || echo "WRITE_FAILED"`;
+
+    // base64 -d reads the base64 content from stdin (set by the parent process)
+    // and writes the decoded bytes to the target. On success, restore the
+    // original mode (no-op if the file did not exist before).
+    command += `if base64 -d > "${filePath}"; then [ -n "$_ORIG_MODE" ] && chmod "$_ORIG_MODE" "${filePath}"; echo "WRITE_SUCCESS"; else echo "WRITE_FAILED"; fi`;
 
     return new Promise((resolve, reject) => {
       const child = spawn('ssh', [host, command], {
@@ -1763,9 +1778,17 @@ class SSHMCPServer {
     if (createFile) {
       command += `touch "${filePath}"; `;
     }
-    
-    // Use base64 -d with stdin to avoid shell interpretation of the base64 content
-    command += `base64 -d >> "${filePath}"`;
+
+    // Capture original mode so we can restore it after the append.
+    // `>>` preserves inode/mode of the existing file, so this is defensive but
+    // keeps the contract consistent with the other write tools.
+    command += `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); `;
+
+    // Use base64 -d with stdin to avoid shell interpretation of the base64 content.
+    // Capture the append's exit code, restore mode on success, then propagate the code.
+    command += `base64 -d >> "${filePath}"; _RC=$?; `;
+    command += `[ "$_RC" -eq 0 ] && [ -n "$_ORIG_MODE" ] && chmod "$_ORIG_MODE" "${filePath}"; `;
+    command += `exit $_RC`;
 
     return new Promise((resolve, reject) => {
       const child = spawn('ssh', [host, command], {
@@ -3127,8 +3150,15 @@ class SSHMCPServer {
     // Encode new content as base64 to safely transfer arbitrary text
     const encodedContent = Buffer.from(newContent).toString('base64');
 
-    // Build backup command prefix
-    const backupCmd = backup ? `[ -f "${filePath}" ] && cp "${filePath}" "${filePath}.bak"; ` : '';
+    // Build backup command prefix (cp -p preserves mode + timestamps so .bak rollback is symmetric)
+    const backupCmd = backup ? `[ -f "${filePath}" ] && cp -p "${filePath}" "${filePath}.bak"; ` : '';
+
+    // Capture original mode so we can restore it after mv/os.replace clobbers it.
+    // mktemp gives the temp file a 0600 mode and `mv` keeps the source's inode/mode,
+    // so without this restore the destination ends up 0600 instead of (e.g.) 0755.
+    const captureModeCmd = `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); `;
+    // Use [ -z ... ] || chmod so the chain always returns 0 (empty mode short-circuits cleanly)
+    const restoreModeCmd = `[ -z "$_ORIG_MODE" ] || chmod "$_ORIG_MODE" "${filePath}"; `;
 
     let script: string;
 
@@ -3137,6 +3167,7 @@ class SSHMCPServer {
       // Strategy: use awk to output lines before start_line, then new_content, then lines after end_line
       script = `
 set -e
+${captureModeCmd}
 ${backupCmd}
 TMPFILE=$(mktemp)
 NEW_CONTENT=$(printf '%s' '${encodedContent}' | base64 -d)
@@ -3148,6 +3179,7 @@ NR > start && NR <= end { next }
 NR > end { print }
 ' "${filePath}" > "$TMPFILE"
 mv "$TMPFILE" "${filePath}"
+${restoreModeCmd}
 echo "REPLACE_SUCCESS:lines_${startLine}_to_${endLine}"
 `;
     } else if (mode === 'pattern_anchored') {
@@ -3156,6 +3188,7 @@ echo "REPLACE_SUCCESS:lines_${startLine}_to_${endLine}"
       const inclusiveFlag = inclusive ? 1 : 0;
       script = `
 set -e
+${captureModeCmd}
 ${backupCmd}
 TMPFILE=$(mktemp)
 NEW_CONTENT=$(printf '%s' '${encodedContent}' | base64 -d)
@@ -3188,6 +3221,7 @@ if grep -q "AWK_PATTERN_NOT_CLOSED" /dev/stderr 2>/dev/null; then
   exit 1
 fi
 mv "$TMPFILE" "${filePath}"
+${restoreModeCmd}
 echo "REPLACE_SUCCESS:pattern_anchored"
 `;
     } else if (mode === 'marker_based') {
@@ -3195,6 +3229,7 @@ echo "REPLACE_SUCCESS:pattern_anchored"
       const safeMarker = marker!.replace(/'/g, "'\\''");
       script = `
 set -e
+${captureModeCmd}
 ${backupCmd}
 TMPFILE=$(mktemp)
 NEW_CONTENT=$(printf '%s' '${encodedContent}' | base64 -d)
@@ -3244,6 +3279,7 @@ if [ -n "$STDERR_CHECK" ]; then
   exit 1
 fi
 mv "$TMPFILE" "${filePath}"
+${restoreModeCmd}
 echo "REPLACE_SUCCESS:marker_based:${safeMarker}"
 `;
     } else {
@@ -3252,6 +3288,7 @@ echo "REPLACE_SUCCESS:marker_based:${safeMarker}"
       const encodedOldString = Buffer.from(oldString!).toString('base64');
       script = `
 set -e
+${captureModeCmd}
 ${backupCmd}
 OLD_CONTENT=$(printf '%s' '${encodedOldString}' | base64 -d)
 NEW_CONTENT=$(printf '%s' '${encodedContent}' | base64 -d)
@@ -3276,6 +3313,7 @@ with open(tmppath, 'wb') as f:
 os.replace(tmppath, filepath)
 print('REPLACE_SUCCESS:exact_match')
 PYEOF
+${restoreModeCmd}
 `;
     }
 
