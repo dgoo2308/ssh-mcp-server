@@ -1542,9 +1542,11 @@ class SSHMCPServer {
     // Use base64 encoding for all content to avoid escaping issues
     let command = '';
 
-    // Capture original mode so we can restore after sed -i (BusyBox sed has historic
-    // edge cases where -i does not preserve mode). Restored at the end of the command.
-    command += `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); `;
+    // Capture original mode + ownership so we can restore after sed -i. BusyBox sed
+    // has historic edge cases where -i does not preserve mode, and even on GNU sed
+    // ownership is not preserved when the SSH user differs from the file owner.
+    // Restored at the end of the command (chown best-effort).
+    command += `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); _ORIG_OWN=$(stat -c %u:%g "${filePath}" 2>/dev/null || echo ""); `;
 
     // Create backup if requested (cp -p so .bak matches original mode + timestamps)
     if (backup) {
@@ -1612,9 +1614,10 @@ class SSHMCPServer {
         throw new McpError(ErrorCode.InvalidRequest, `Unknown operation: ${operation}`);
     }
 
-    // Capture the edit's exit code, restore mode on success, then propagate the code
-    // (no-op if the file did not exist before, since _ORIG_MODE will be empty).
-    command += `; _RC=$?; [ "$_RC" -eq 0 ] && [ -n "$_ORIG_MODE" ] && chmod "$_ORIG_MODE" "${filePath}"; exit $_RC`;
+    // Capture the edit's exit code, restore mode + ownership on success, then propagate
+    // the code (no-op if the file did not exist before, since _ORIG_* will be empty).
+    // chown is best-effort — silenced + `|| true` so it cannot mask the write's exit code.
+    command += `; _RC=$?; [ "$_RC" -eq 0 ] && [ -n "$_ORIG_MODE" ] && chmod "$_ORIG_MODE" "${filePath}"; [ "$_RC" -eq 0 ] && [ -n "$_ORIG_OWN" ] && chown "$_ORIG_OWN" "${filePath}" 2>/dev/null || true; exit $_RC`;
 
     return new Promise((resolve, reject) => {
       const child = spawn('ssh', [host, command], {
@@ -1680,20 +1683,20 @@ class SSHMCPServer {
       command += `mkdir -p "$(dirname "${filePath}")"; `;
     }
 
-    // Capture original mode before any backup/write so we can restore it after.
-    // `>` truncates and preserves inode/mode of an existing file, so this is largely
-    // defensive — but it makes the contract explicit and survives remote shells
-    // that may re-create the file under noclobber fallbacks.
-    command += `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); `;
+    // Capture original mode + ownership before any backup/write so we can restore
+    // them after. `>` truncates and preserves inode of an existing file, so this is
+    // largely defensive — but it makes the contract explicit and survives remote
+    // shells that may re-create the file under noclobber fallbacks.
+    command += `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); _ORIG_OWN=$(stat -c %u:%g "${filePath}" 2>/dev/null || echo ""); `;
 
     if (backup) {
       command += `[ -f "${filePath}" ] && cp -p "${filePath}" "${filePath}.bak"; `;
     }
 
     // base64 -d reads the base64 content from stdin (set by the parent process)
-    // and writes the decoded bytes to the target. On success, restore the
-    // original mode (no-op if the file did not exist before).
-    command += `if base64 -d > "${filePath}"; then [ -n "$_ORIG_MODE" ] && chmod "$_ORIG_MODE" "${filePath}"; echo "WRITE_SUCCESS"; else echo "WRITE_FAILED"; fi`;
+    // and writes the decoded bytes to the target. On success, restore the original
+    // mode and ownership (no-op if the file did not exist before; chown is best-effort).
+    command += `if base64 -d > "${filePath}"; then [ -n "$_ORIG_MODE" ] && chmod "$_ORIG_MODE" "${filePath}"; [ -n "$_ORIG_OWN" ] && chown "$_ORIG_OWN" "${filePath}" 2>/dev/null || true; echo "WRITE_SUCCESS"; else echo "WRITE_FAILED"; fi`;
 
     return new Promise((resolve, reject) => {
       const child = spawn('ssh', [host, command], {
@@ -1779,15 +1782,17 @@ class SSHMCPServer {
       command += `touch "${filePath}"; `;
     }
 
-    // Capture original mode so we can restore it after the append.
+    // Capture original mode + ownership so we can restore them after the append.
     // `>>` preserves inode/mode of the existing file, so this is defensive but
     // keeps the contract consistent with the other write tools.
-    command += `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); `;
+    command += `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); _ORIG_OWN=$(stat -c %u:%g "${filePath}" 2>/dev/null || echo ""); `;
 
     // Use base64 -d with stdin to avoid shell interpretation of the base64 content.
-    // Capture the append's exit code, restore mode on success, then propagate the code.
+    // Capture the append's exit code, restore mode + ownership on success, then
+    // propagate the code (chown is best-effort — silenced + `|| true`).
     command += `base64 -d >> "${filePath}"; _RC=$?; `;
     command += `[ "$_RC" -eq 0 ] && [ -n "$_ORIG_MODE" ] && chmod "$_ORIG_MODE" "${filePath}"; `;
+    command += `[ "$_RC" -eq 0 ] && [ -n "$_ORIG_OWN" ] && chown "$_ORIG_OWN" "${filePath}" 2>/dev/null || true; `;
     command += `exit $_RC`;
 
     return new Promise((resolve, reject) => {
@@ -3153,12 +3158,15 @@ class SSHMCPServer {
     // Build backup command prefix (cp -p preserves mode + timestamps so .bak rollback is symmetric)
     const backupCmd = backup ? `[ -f "${filePath}" ] && cp -p "${filePath}" "${filePath}.bak"; ` : '';
 
-    // Capture original mode so we can restore it after mv/os.replace clobbers it.
-    // mktemp gives the temp file a 0600 mode and `mv` keeps the source's inode/mode,
-    // so without this restore the destination ends up 0600 instead of (e.g.) 0755.
-    const captureModeCmd = `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); `;
-    // Use [ -z ... ] || chmod so the chain always returns 0 (empty mode short-circuits cleanly)
-    const restoreModeCmd = `[ -z "$_ORIG_MODE" ] || chmod "$_ORIG_MODE" "${filePath}"; `;
+    // Capture original mode + ownership so we can restore them after mv/os.replace
+    // clobbers the inode. mktemp gives the temp file a 0600 mode and the calling
+    // user's ownership, so without these restores the destination ends up 0600
+    // and owned by the SSH user instead of (e.g.) 0755 root:root.
+    const captureModeCmd = `_ORIG_MODE=$(stat -c %a "${filePath}" 2>/dev/null || echo ""); _ORIG_OWN=$(stat -c %u:%g "${filePath}" 2>/dev/null || echo ""); `;
+    // Use [ -z ... ] || chmod so the chain always returns 0 (empty short-circuits cleanly).
+    // chown is best-effort: it requires root on most systems, so failure must not
+    // break the write — the file content is already correctly in place.
+    const restoreModeCmd = `[ -z "$_ORIG_MODE" ] || chmod "$_ORIG_MODE" "${filePath}"; [ -z "$_ORIG_OWN" ] || chown "$_ORIG_OWN" "${filePath}" 2>/dev/null || true; `;
 
     let script: string;
 
