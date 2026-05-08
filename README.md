@@ -25,6 +25,7 @@ An MCP (Model Context Protocol) server that enables SSH remote command execution
 - **Edit Files**: Line-based editing with replace, insert, and delete operations
 - **Rewrite Files**: Complete file content replacement with backup support
 - **Append to Files**: Add content to the end of files
+- **Mode & Ownership Preservation**: All write operations (`ssh_edit_file`, `ssh_rewrite_file`, `ssh_append_to_file`, `ssh_replace_in_file`) keep the original file mode and ownership — executable scripts stay 0755 across edits (v0.10.1)
 - **Auto Directory Creation**: Automatically creates parent directories
 - **Secure Transfer**: Uses your existing SSH keys and security settings
 - **Base64 Content Handling**: Safe handling of special characters and multi-line content
@@ -1279,6 +1280,44 @@ The fix ensures reliability across different Linux distributions:
 - **CentOS/RHEL**: Works with GNU sed variations  
 - **Alpine Linux**: Compatible with BusyBox sed
 - **Embedded systems**: Handles limited `/tmp` space scenarios
+
+## 🔒 File Mode & Ownership Preservation (v0.10.1)
+
+### What Was Fixed
+
+Prior to v0.10.1, all four write tools could silently strip the executable bit (and other mode bits) from remote files. `ssh_replace_in_file` was the worst offender — its four modes finalize the write with `mv $TMPFILE $path` (or Python's `os.replace`), which swaps the destination's inode and inherits the temp file's umask-derived mode. A 0755 cron script edited via the MCP would land back on disk as 0644 and silently fail with `Permission denied` the next time cron ran it.
+
+`ssh_rewrite_file`, `ssh_edit_file`, and `ssh_append_to_file` were technically OK for mode (their `>` / `>>` / `sed -i` paths preserve inode), but the contract was implicit and ownership was never preserved on any of them — files edited from a non-root SSH user lost their original `uid:gid`.
+
+### What v0.10.1 Does
+
+Every write tool now wraps the actual modification with:
+
+```bash
+_ORIG_MODE=$(stat -c %a "$path" 2>/dev/null || echo "")
+_ORIG_OWN=$(stat -c %u:%g "$path" 2>/dev/null || echo "")
+# ... write happens here ...
+[ -z "$_ORIG_MODE" ] || chmod "$_ORIG_MODE" "$path"
+[ -z "$_ORIG_OWN" ] || chown "$_ORIG_OWN" "$path" 2>/dev/null || true
+```
+
+Two intentional asymmetries:
+
+- **`chmod` is strict.** A chmod failure on a file the SSH user just wrote is genuinely abnormal and is allowed to surface.
+- **`chown` is best-effort** (silenced + `|| true`). chown typically fails for non-root SSH users, and there's no point flipping a successful write to "failed" just because we couldn't restore the uid. Files retain whatever ownership the kernel assigned during the write (usually the SSH user's uid).
+
+If the target path did **not** exist before the call (truly new file), both `_ORIG_*` capture variables are empty and the restores short-circuit cleanly — caller chmod's it as desired.
+
+### Backup Symmetry
+
+The `.bak` files produced by `backup: true` were also fixed in this release: `cp` was replaced with `cp -p` everywhere, so backups now share the original mode and timestamps. Rolling back via `mv $path.bak $path` now restores a byte-for-byte equivalent, not a 0644 stripped copy.
+
+### Affected Tools
+
+- `ssh_replace_in_file` — primary fix (all 4 modes: line_range, pattern_anchored, marker_based, exact_match)
+- `ssh_rewrite_file` — defensive (was OK for mode, now preserves ownership too)
+- `ssh_edit_file` — defensive (BusyBox `sed -i` had historic edge cases; ownership now preserved)
+- `ssh_append_to_file` — defensive (`>>` was OK for mode; ownership now preserved)
 
 ## 📁 Project Structure
 
